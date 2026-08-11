@@ -7,6 +7,10 @@ in the rest of this repository — no shared imports, no shared config.
 > **Paper trading only.** There is no code path in this package that can place a
 > live order. See [Safety](#safety) for the five independent checks that enforce
 > this.
+>
+> **Every order passes a risk gate.** Position-size and exposure caps, a
+> latching daily-loss circuit breaker, and a kill switch — enforced by a
+> clearance token that `_submit` requires, so the layer cannot be routed around.
 
 ---
 
@@ -39,9 +43,15 @@ python -m pairs_trading.main --backtest --pair KO/PEP
 # 3. Compare spread constructions and thresholds.
 python -m pairs_trading.main --backtest --pair GOOGL/MSFT --method log_ratio --entry-z 2.5
 
-# 4. Paper trade — dry run first, which computes orders but submits nothing.
+# 4. Check the risk limits and halt state before going anywhere near the broker.
+python -m pairs_trading.main --risk-status
+
+# 5. Paper trade — dry run first. Runs every risk check, submits nothing.
 python -m pairs_trading.main --paper-trade --pair KO/PEP --dry-run
 python -m pairs_trading.main --paper-trade --pair KO/PEP
+
+# 6. Emergency stop, any time.
+python -m pairs_trading.kill_switch --reason "stopping for the day"
 ```
 
 An installed copy also exposes the console script `pairs-trading`.
@@ -127,7 +137,64 @@ every fill marked, and cumulative P&L with drawdown.
 rolling hedge ratio and z-score use only trailing windows — both properties are
 asserted in the test suite.
 
-### 5. Execution (`execution_alpaca.py`)
+### 5. Risk controls (`risk_manager.py`, `kill_switch.py`)
+
+Every order passes through the risk layer before reaching Alpaca. The interlock
+is structural, not conventional: `validate_order` returns a **clearance token**
+that fingerprints the exact orders it approved, and `_submit` refuses to act
+without one that covers the order in its hand. A future code path that forgets
+to call the risk manager gets a `RiskError`, not a fill.
+
+Validation is **atomic over the whole pair**. Clearing leg one, filling it, then
+rejecting leg two on an exposure cap would leave a naked directional position —
+so clearance covers both legs or neither.
+
+**Pre-trade checklist** (all must pass):
+
+| Check | Applies to | On failure |
+|---|---|---|
+| `TRADING_HALTED` flag absent | entries | `TradingHaltedError` |
+| Market open | all | reject |
+| Daily loss limit not breached | entries | reject + trip breaker |
+| Notional ≤ `max_position_size_usd` | entries | reject (never resize) |
+| Exposure + order ≤ `max_total_exposure_usd` | entries | reject |
+| Sufficient buying power | all | reject |
+
+Exits deliberately skip the halt, loss and exposure checks. Those exist to stop
+the book *growing*; applying them to closing orders would block the very trades
+that shrink it, trapping a position exactly when you most need out.
+
+**Circuit breaker.** Daily P&L is `equity − start_of_day_equity`; since Alpaca's
+equity already marks open positions to market, that one number covers realised
+*and* unrealised. The baseline is persisted, so a mid-session restart does not
+reset the measurement. On breach it logs, alerts, optionally flattens
+(`close_positions_on_breach`), and **latches** — it writes the same
+`TRADING_HALTED` file the kill switch uses, so trading cannot resume when the
+date rolls over and today's loss resets to zero. Clearing it is a manual act.
+
+**Kill switch.**
+
+```bash
+python -m pairs_trading.kill_switch                    # cancel, flatten, halt
+python -m pairs_trading.kill_switch --status
+python -m pairs_trading.kill_switch --clear            # manual resume
+python -m pairs_trading.kill_switch --halt-only        # stop without flattening
+python -m pairs_trading.kill_switch --dry-run          # drill; still halts
+```
+
+It writes the halt flag **before** any broker call, so a network failure still
+leaves the system stopped. Broker errors are collected rather than raised — one
+symbol that will not close must not prevent the others from closing.
+
+**Alerting** is transport-agnostic: `AlertChannel` subclasses plug into an
+`AlertDispatcher`. Email over SMTP ships; SMS or Slack is one subclass with no
+change to calling code. Channel failures are swallowed and logged — a dead mail
+server must never stop a halt.
+
+Everything lands in `logs/risk_events.csv` with full account context at the
+moment of the decision.
+
+### 6. Execution (`execution_alpaca.py`)
 
 `sync_to_signal` is a **reconciler**, not an order generator: it reads the target
 and the broker's actual position and issues only the difference. Running it twice
@@ -140,6 +207,19 @@ an unhedged single leg is a naked directional bet.
 ---
 
 ## Safety
+
+### Risk limits
+
+All limits live in `config.yaml` under `risk:` and are overridable per run
+(`--max-position-size`, `--max-total-exposure`, `--max-daily-loss`).
+`--risk-status` prints the current limits and halt state without touching the
+broker. `--dry-run` runs the full pipeline including every risk check and logs
+`WOULD HAVE PLACED ORDER` instead of calling Alpaca — the way to exercise the
+risk layer in isolation.
+
+Exit codes: `3` halted, `4` circuit breaker tripped, `5` order rejected by risk.
+
+### Paper-trading guarantee
 
 Five independent checks, each sufficient on its own:
 
@@ -175,6 +255,12 @@ you had changed.
 are likely to mislead (zero execution lag, a static full-sample hedge ratio,
 zero costs, a half-life longer than the z-score window).
 
+### Logs
+
+Two CSVs, deliberately separate. `trades.csv` records what the account **did**;
+`risk_events.csv` records what it was **stopped from doing**. The second is the
+one you read after a bad day.
+
 ### Trade log
 
 Every fill, backtest and paper alike, appends to `logs/trades.csv` with the same
@@ -192,10 +278,10 @@ The two legs of one trade share a `group_id`.
 ## Tests
 
 ```bash
-python -m pytest tests/test_pairs_trading.py -q
+python -m pytest tests/test_pairs_trading.py tests/test_risk_manager.py -q
 ```
 
-90 tests, fully offline — no network, no API keys. Synthetic series are built
+140 tests, fully offline — no network, no API keys. Synthetic series are built
 with a known half-life (`-ln(2)/ln(φ)` for an AR(1) with coefficient φ), so the
 diagnostics are checked against analytically known values rather than against
 themselves.

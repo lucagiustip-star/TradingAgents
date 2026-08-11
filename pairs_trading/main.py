@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Run the cointegration tests and exit without trading.")
     mode.add_argument("--close-all", action="store_true",
                       help="Flatten both legs of the pair on the PAPER account and exit.")
+    mode.add_argument("--risk-status", action="store_true",
+                      help="Print the current risk limits and halt state, then exit.")
 
     parser.add_argument("--pair", type=_parse_pair, metavar="Y/X",
                         help="Ticker pair, dependent leg first (e.g. KO/PEP).")
@@ -112,7 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     live = parser.add_argument_group("paper trading")
     live.add_argument("--dry-run", action="store_true",
-                      help="Compute orders and log them without submitting to Alpaca.")
+                      help="Run the full pipeline including every risk check, but log "
+                           "'WOULD HAVE PLACED ORDER' instead of calling Alpaca. The way to "
+                           "exercise the risk layer in isolation.")
+
+    risk = parser.add_argument_group("risk controls")
+    risk.add_argument("--max-position-size", type=float, metavar="USD",
+                      help="Cap on gross notional per pairs trade.")
+    risk.add_argument("--max-total-exposure", type=float, metavar="USD",
+                      help="Cap on gross notional across all open positions.")
+    risk.add_argument("--max-daily-loss", type=float, metavar="USD",
+                      help="Daily loss that trips the circuit breaker.")
 
     return parser
 
@@ -164,9 +176,15 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
 
     logging_cfg = {"trade_log": args.trade_log}
 
+    risk = {
+        "max_position_size_usd": args.max_position_size,
+        "max_total_exposure_usd": args.max_total_exposure,
+        "max_daily_loss_usd": args.max_daily_loss,
+    }
+
     return config.with_overrides(
-        pair=pair, data=data, spread=spread, signal=signal,
-        backtest=backtest, cointegration=coint, plot=plot, logging=logging_cfg,
+        pair=pair, data=data, spread=spread, signal=signal, backtest=backtest,
+        cointegration=coint, plot=plot, logging=logging_cfg, risk=risk,
     )
 
 
@@ -241,8 +259,36 @@ def cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _check_not_halted(config: Config) -> int | None:
+    """Refuse to trade while the ``TRADING_HALTED`` flag is present.
+
+    The flag is written by the circuit breaker and by ``kill_switch.py``, and
+    nothing removes it automatically -- resuming is a deliberate human act, so
+    that a breached loss limit cannot quietly un-breach itself overnight.
+    """
+    from .risk_manager import RiskManager
+
+    risk = RiskManager(config)
+    if not risk.is_halted():
+        return None
+
+    print(
+        f"\n  TRADING IS HALTED -- refusing to trade.\n\n"
+        f"  flag  : {risk.halt_file}\n"
+        f"  reason: {risk.halt_reason()}\n\n"
+        f"  Review what happened (risk log: {resolve_path(config.risk.risk_log)}), then clear it:\n"
+        f"      python -m pairs_trading.kill_switch --clear\n",
+        file=sys.stderr,
+    )
+    return 3
+
+
 def cmd_paper_trade(config: Config, args: argparse.Namespace) -> int:
     from .execution_alpaca import build_trader
+
+    halted = _check_not_halted(config)
+    if halted is not None:
+        return halted
 
     data = _load_data(config, args)
     _run_cointegration(data, config, args)
@@ -251,24 +297,99 @@ def cmd_paper_trade(config: Config, args: argparse.Namespace) -> int:
     print()
     print(trader.account_summary())
     print()
+    print(_risk_summary(config, trader))
+    print()
 
     outcome = trader.sync_to_signal(data)
-    signal = outcome["signal"]
-    print(
-        f" Signal   : {signal['date']}  z={signal['zscore']:+.3f}  "
-        f"target={outcome['target_direction']:+d}  ({signal['reason'] or 'no change'})"
-    )
+    signal = outcome.get("signal")
+    if signal:
+        print(
+            f" Signal   : {signal['date']}  z={signal['zscore']:+.3f}  "
+            f"target={outcome['target_direction']:+d}  ({signal['reason'] or 'no change'})"
+        )
     print(f" Action   : {outcome['action']}")
-    if outcome["orders"]:
+    if outcome.get("orders"):
         print(f" Orders   : {', '.join(outcome['orders'])}")
+    if outcome.get("rejected_reasons"):
+        print(" BLOCKED by risk controls:")
+        for reason in outcome["rejected_reasons"]:
+            print(f"   - {reason}")
     if args.dry_run:
-        print(" (dry run -- nothing was submitted)")
+        print(" (dry run -- risk checks ran in full; no order was submitted)")
+
+    if outcome["action"] == "circuit_breaker":
+        return 4
+    if outcome.get("rejected_reasons"):
+        return 5
     return 0
+
+
+def _risk_summary(config: Config, trader) -> str:
+    """Render the current risk state before acting."""
+    risk_cfg = config.risk
+    try:
+        snapshot = trader.account_snapshot()
+        limit = trader.risk.daily_loss_limit(snapshot)
+        return (
+            f" Risk     : daily P&L ${snapshot.daily_pnl:,.2f} of ${limit:,.2f} limit  |  "
+            f"exposure ${snapshot.open_exposure:,.2f} of "
+            f"${risk_cfg.max_total_exposure_usd or float('inf'):,.2f}  |  "
+            f"per-trade cap ${risk_cfg.max_position_size_usd or float('inf'):,.2f}"
+        )
+    except Exception as exc:  # reporting must not block trading
+        return f" Risk     : (could not read account state: {exc})"
+
+
+def cmd_risk_status(config: Config, args: argparse.Namespace) -> int:
+    """Print the configured limits and the current halt state, without trading.
+
+    Deliberately makes no broker call, so it answers "am I halted and what are
+    my limits" even when Alpaca is unreachable.
+    """
+    from .risk_manager import RiskManager
+
+    risk = RiskManager(config)
+    cfg = config.risk
+
+    def money(value):
+        return f"${value:,.2f}" if value is not None else "disabled"
+
+    print("=" * 68)
+    print(" RISK CONTROLS")
+    print("=" * 68)
+    print(f"  Max position size (per trade) : {money(cfg.max_position_size_usd)}")
+    print(f"  Max total exposure            : {money(cfg.max_total_exposure_usd)}")
+    print(f"  Max daily loss                : {money(cfg.max_daily_loss_usd)}")
+    print(
+        "  Max daily loss (%)            : "
+        + (f"{cfg.max_daily_loss_pct:.2%} of start-of-day equity"
+           if cfg.max_daily_loss_pct is not None else "disabled")
+    )
+    print(f"  Close positions on breach     : {cfg.close_positions_on_breach}")
+    print(f"  Require market open           : {cfg.require_market_open}")
+    print()
+    print(f"  Risk event log                : {resolve_path(cfg.risk_log)}")
+    print(f"  Halt flag                     : {risk.halt_file}")
+    print(f"  State file                    : {risk.state_file}")
+    print()
+    if risk.is_halted():
+        print("  STATUS: HALTED -- no new positions will be opened.")
+        print(f"  Reason: {risk.halt_reason()}")
+        print("  Clear with: python -m pairs_trading.kill_switch --clear")
+        if args.verbose:
+            print("\n  Halt file contents:")
+            for line in risk.halt_details().splitlines():
+                print(f"    {line}")
+    else:
+        print("  STATUS: ACTIVE")
+    print("=" * 68)
+    return 3 if risk.is_halted() else 0
 
 
 def cmd_close_all(config: Config, args: argparse.Namespace) -> int:
     from .execution_alpaca import build_trader
 
+    # Deliberately NOT halt-gated: flattening must work while halted.
     trader = build_trader(config, config.logging.trade_log, dry_run=args.dry_run)
     print(trader.account_summary())
     ids = trader.close_all()
@@ -291,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("Config advisory: %s", note)
 
     try:
+        if args.risk_status:
+            return cmd_risk_status(config, args)
         if args.check_only:
             return cmd_check(config, args)
         if args.backtest:

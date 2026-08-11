@@ -235,6 +235,71 @@ class ExecutionConfig:
 
 
 @dataclass(frozen=True)
+class RiskConfig:
+    """Hard limits enforced by ``risk_manager.py`` before any order is sent.
+
+    Every value here is a *cap*, not a target. Breaching one rejects the order
+    outright rather than resizing it, on the principle that a silently shrunk
+    position is a different trade from the one the strategy asked for.
+
+    Attributes:
+        max_position_size_usd: Cap on the gross notional of a single pairs
+            trade (both legs summed). ``None`` disables the check.
+        max_total_exposure_usd: Cap on gross notional across all open positions
+            plus the proposed order.
+        max_daily_loss_usd: Absolute daily loss that trips the circuit breaker.
+        max_daily_loss_pct: Same limit as a fraction of start-of-day equity.
+            When both are set the tighter one binds.
+        close_positions_on_breach: Flatten open positions when the breaker
+            trips.
+        halt_file: Flag file written by the breaker and the kill switch. Its
+            presence blocks all new entries until manually cleared.
+        state_file: Persists the start-of-day equity baseline, so a mid-session
+            restart does not reset the daily-loss measurement.
+        require_market_open: Reject orders while the market is closed.
+        buying_power_buffer_usd: Headroom left unspent when checking buying
+            power.
+        alert_on_rejection: Send an alert for routine limit rejections, not just
+            breaches and kill-switch activations.
+    """
+
+    max_position_size_usd: float | None = 5_000.0
+    max_total_exposure_usd: float | None = 20_000.0
+    max_daily_loss_usd: float | None = 1_000.0
+    max_daily_loss_pct: float | None = None
+    close_positions_on_breach: bool = True
+    halt_file: str = "logs/TRADING_HALTED"
+    state_file: str = "logs/risk_state.json"
+    risk_log: str = "logs/risk_events.csv"
+    require_market_open: bool = True
+    buying_power_buffer_usd: float = 0.0
+    alert_on_rejection: bool = True
+
+    def __post_init__(self) -> None:
+        for name in ("max_position_size_usd", "max_total_exposure_usd", "max_daily_loss_usd"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ConfigError(f"risk.{name} must be positive, or null to disable; got {value}.")
+        if self.max_daily_loss_pct is not None and not 0 < self.max_daily_loss_pct < 1:
+            raise ConfigError(
+                f"risk.max_daily_loss_pct must be a fraction in (0, 1) -- 0.02 for 2% -- "
+                f"got {self.max_daily_loss_pct}."
+            )
+        if (
+            self.max_position_size_usd is not None
+            and self.max_total_exposure_usd is not None
+            and self.max_position_size_usd > self.max_total_exposure_usd
+        ):
+            raise ConfigError(
+                f"risk.max_position_size_usd ({self.max_position_size_usd:,.0f}) exceeds "
+                f"risk.max_total_exposure_usd ({self.max_total_exposure_usd:,.0f}); a single "
+                "trade could never be opened without breaching the aggregate cap."
+            )
+        if self.buying_power_buffer_usd < 0:
+            raise ConfigError("risk.buying_power_buffer_usd cannot be negative.")
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     trade_log: str = "logs/trades.csv"
     level: str = "INFO"
@@ -258,6 +323,7 @@ class Config:
     cointegration: CointegrationConfig = field(default_factory=CointegrationConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     plot: PlotConfig = field(default_factory=PlotConfig)
     source_path: str | None = None
@@ -322,6 +388,32 @@ class Config:
             notes.append(
                 "Both commission_bps and slippage_bps are 0. Pairs trading turns over two legs "
                 "per round trip, so frictionless results overstate a real strategy materially."
+            )
+
+        # A pair entry is two legs of roughly notional_per_leg each. If that
+        # always exceeds the per-trade cap, every order is rejected and the
+        # system looks broken rather than merely conservative.
+        risk, execu = self.risk, self.execution
+        pair_notional = 2 * execu.notional_per_leg
+        if risk.max_position_size_usd is not None and pair_notional > risk.max_position_size_usd:
+            notes.append(
+                f"A pair entry costs about ${pair_notional:,.0f} (2 x execution.notional_per_leg) "
+                f"but risk.max_position_size_usd is ${risk.max_position_size_usd:,.0f}, so nearly "
+                "every order will be rejected on size. Raise the cap or lower notional_per_leg."
+            )
+        if (
+            risk.max_total_exposure_usd is not None
+            and pair_notional > risk.max_total_exposure_usd
+        ):
+            notes.append(
+                f"A single pair entry (~${pair_notional:,.0f}) exceeds "
+                f"risk.max_total_exposure_usd (${risk.max_total_exposure_usd:,.0f}); no position "
+                "can ever be opened."
+            )
+        if risk.max_daily_loss_usd is None and risk.max_daily_loss_pct is None:
+            notes.append(
+                "No daily loss limit is configured (both risk.max_daily_loss_usd and "
+                "max_daily_loss_pct are null). The circuit breaker will never trip."
             )
         return notes
 
@@ -422,6 +514,7 @@ def load_config(path: str | Path | None = None) -> Config:
         cointegration=_build(CointegrationConfig, _section(raw, "cointegration"), "cointegration"),
         backtest=_build(BacktestConfig, _section(raw, "backtest"), "backtest"),
         execution=_build(ExecutionConfig, _section(raw, "execution"), "execution"),
+        risk=_build(RiskConfig, _section(raw, "risk"), "risk"),
         logging=_build(LoggingConfig, _section(raw, "logging"), "logging"),
         plot=_build(PlotConfig, _section(raw, "plot"), "plot"),
         source_path=str(cfg_path),

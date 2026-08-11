@@ -91,8 +91,26 @@ def make_independent(n: int = 1200, seed: int = 7):
 
 
 @pytest.fixture
-def config() -> Config:
-    return load_config().with_overrides(pair={"y": "AAA", "x": "BBB"})
+def config(tmp_path) -> Config:
+    """Test config with every risk artefact redirected into tmp_path.
+
+    The halt flag, risk state and risk log must never be written to the real
+    ``logs/`` directory: a leftover halt file from a test run would block a
+    subsequent real run, and a stale equity baseline would corrupt the daily
+    loss calculation.
+    """
+    from dataclasses import replace
+
+    cfg = load_config().with_overrides(pair={"y": "AAA", "x": "BBB"})
+    return replace(
+        cfg,
+        risk=replace(
+            cfg.risk,
+            halt_file=str(tmp_path / "TRADING_HALTED"),
+            state_file=str(tmp_path / "risk_state.json"),
+            risk_log=str(tmp_path / "risk_events.csv"),
+        ),
+    )
 
 
 @pytest.fixture
@@ -282,17 +300,22 @@ class TestExecution:
             self._trader(config, fake_alpaca)
 
     def test_refuses_to_trade_when_the_market_is_closed(self, config, fake_alpaca, coint_data):
-        """An order sent while closed fills at an unrelated price on the next open."""
-        from unittest.mock import MagicMock
+        """An order sent while closed fills at an unrelated price on the next open.
 
-        from pairs_trading.execution_alpaca import ExecutionError
+        Since the risk layer landed, a closed market is a *reported* rejection
+        rather than an exception: a scheduled run should record the refusal and
+        exit cleanly instead of crashing.
+        """
+        from unittest.mock import MagicMock
 
         fake_alpaca.get_clock.return_value = MagicMock(
             is_open=False, next_open="2026-01-02T14:30:00Z"
         )
         trader = self._trader(config, fake_alpaca)
-        with pytest.raises(ExecutionError, match="market is closed"):
-            trader.sync_to_signal(coint_data)
+        outcome = trader.sync_to_signal(coint_data)
+        assert outcome["action"] == "rejected"
+        assert any("market is closed" in r.lower() for r in outcome["rejected_reasons"])
+        fake_alpaca.submit_order.assert_not_called()
 
     def test_opens_a_position_from_flat(self, config, fake_alpaca, coint_data):
         trader = self._trader(config, fake_alpaca)

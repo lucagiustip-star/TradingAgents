@@ -47,6 +47,14 @@ from urllib.parse import urlparse
 
 from .config import Config, alpaca_credentials
 from .data import PairData
+from .risk_manager import (
+    AccountSnapshot,
+    ProposedOrder,
+    RiskClearance,
+    RiskManager,
+    RiskRejection,
+    orders_from_legs,
+)
 from .strategy import Position, latest_signal
 from .trade_log import TradeLogger, TradeRecord, make_group_id, utc_now_iso
 
@@ -134,6 +142,9 @@ class BrokerPosition:
 
     shares_y: float
     shares_x: float
+    # Current marks, used to price closing orders. Zero when unknown.
+    price_y: float = 0.0
+    price_x: float = 0.0
 
     @property
     def direction(self) -> int:
@@ -168,14 +179,18 @@ class AlpacaPaperTrader:
     """
 
     def __init__(self, config: Config, trade_logger: TradeLogger | None = None,
-                 dry_run: bool = False) -> None:
+                 dry_run: bool = False, risk: RiskManager | None = None) -> None:
         """
         Args:
             config: Full configuration; ``config.execution`` supplies the
-                endpoint and sizing.
+                endpoint and sizing, ``config.risk`` the limits.
             trade_logger: CSV logger for submitted fills.
-            dry_run: Compute and print the orders that would be sent, without
-                sending them. Every safety check still runs.
+            dry_run: Compute and log the orders that would be sent, without
+                sending them. Every safety and risk check still runs -- that is
+                the point of the flag, since it lets the risk layer itself be
+                exercised end to end without touching the broker.
+            risk: Risk manager. One is constructed from config if omitted;
+                there is no way to disable it.
 
         Raises:
             LiveTradingBlockedError: if any check suggests a live endpoint.
@@ -184,6 +199,8 @@ class AlpacaPaperTrader:
         self.config = config
         self.dry_run = dry_run
         self.trade_logger = trade_logger
+        # Never optional: _submit refuses to act without a clearance from this.
+        self.risk = risk or RiskManager(config)
         exec_cfg = config.execution
 
         # Layer 2: re-validate the configured URL.
@@ -281,9 +298,16 @@ class AlpacaPaperTrader:
     # -- broker state ------------------------------------------------------
 
     def get_pair_position(self) -> BrokerPosition:
-        """Read the account's current share counts for both legs."""
+        """Read the account's current share counts and marks for both legs.
+
+        Current prices are captured alongside the share counts so that closing
+        orders carry a real notional. Without them an exit would price at zero,
+        which understates its size to the risk layer and makes the trade log
+        record a $0 fill.
+        """
         y, x = self.config.pair.tickers
         shares = {y: 0.0, x: 0.0}
+        prices = {y: 0.0, x: 0.0}
         try:
             for pos in self.client.get_all_positions():
                 symbol = str(getattr(pos, "symbol", "")).upper()
@@ -292,9 +316,72 @@ class AlpacaPaperTrader:
                     qty = float(getattr(pos, "qty", 0.0))
                     side = str(getattr(getattr(pos, "side", ""), "value", getattr(pos, "side", "")))
                     shares[symbol] = -abs(qty) if "short" in side.lower() else qty
+                    try:
+                        prices[symbol] = abs(float(getattr(pos, "current_price", 0.0) or 0.0))
+                    except (TypeError, ValueError):
+                        prices[symbol] = 0.0
         except Exception as exc:
             raise ExecutionError(f"Could not read positions from Alpaca: {exc}") from exc
-        return BrokerPosition(shares_y=shares[y], shares_x=shares[x])
+        return BrokerPosition(
+            shares_y=shares[y], shares_x=shares[x],
+            price_y=prices[y], price_x=prices[x],
+        )
+
+    def is_market_open(self) -> bool | None:
+        """Whether the market is open right now, or ``None`` if unknown.
+
+        Unlike :meth:`assert_market_open` this never raises -- the risk layer
+        wants the fact, not an exception, so it can report a closed market
+        alongside any other failed checks rather than short-circuiting on it.
+        """
+        try:
+            return bool(getattr(self.client.get_clock(), "is_open", False))
+        except Exception as exc:
+            logger.warning("Could not fetch the market clock: %s", exc)
+            return None
+
+    def account_snapshot(self) -> AccountSnapshot:
+        """Gather the account state that every risk check reads.
+
+        ``open_exposure`` is the sum of *absolute* market values across all
+        positions. Gross rather than net on purpose: a dollar-neutral pair nets
+        to roughly zero but still consumes buying power and still carries the
+        risk that both legs move against you.
+        """
+        try:
+            account = self.client.get_account()
+        except Exception as exc:
+            raise ExecutionError(f"Could not fetch the account for risk checks: {exc}") from exc
+
+        exposure = 0.0
+        count = 0
+        try:
+            for pos in self.client.get_all_positions() or []:
+                value = getattr(pos, "market_value", None)
+                if value is None:
+                    value = float(getattr(pos, "qty", 0.0) or 0.0) * float(
+                        getattr(pos, "current_price", 0.0) or 0.0
+                    )
+                exposure += abs(float(value or 0.0))
+                count += 1
+        except Exception as exc:
+            logger.warning("Could not read positions for exposure calculation: %s", exc)
+
+        def _num(name: str, default: float = 0.0) -> float:
+            try:
+                return float(getattr(account, name, default) or default)
+            except (TypeError, ValueError):
+                return default
+
+        return self.risk.snapshot(
+            equity=_num("equity"),
+            buying_power=_num("buying_power"),
+            cash=_num("cash"),
+            open_exposure=exposure,
+            position_count=count,
+            last_equity=_num("last_equity") or None,
+            market_open=self.is_market_open(),
+        )
 
     # -- order construction ------------------------------------------------
 
@@ -340,25 +427,52 @@ class AlpacaPaperTrader:
         ]
 
     def _build_close_orders(self, position: BrokerPosition) -> list[LegOrder]:
-        """Build the orders that flatten whatever the account currently holds."""
+        """Build the orders that flatten whatever the account currently holds.
+
+        Priced at the position's current mark where known, so the resulting
+        notional is meaningful to the risk layer and to the trade log.
+        """
         y, x = self.config.pair.tickers
         orders: list[LegOrder] = []
-        for ticker, shares in ((y, position.shares_y), (x, position.shares_x)):
+        for ticker, shares, price in (
+            (y, position.shares_y, position.price_y),
+            (x, position.shares_x, position.price_x),
+        ):
             qty = int(abs(round(shares)))
             if qty >= 1:
-                orders.append(LegOrder(ticker, "SELL" if shares > 0 else "BUY", qty, 0.0))
+                orders.append(
+                    LegOrder(ticker, "SELL" if shares > 0 else "BUY", qty, float(price or 0.0))
+                )
         return orders
 
     # -- submission --------------------------------------------------------
 
-    def _submit(self, order: LegOrder, signal: dict, side_label: str, group: str) -> str:
+    def _submit(
+        self,
+        order: LegOrder,
+        signal: dict,
+        side_label: str,
+        group: str,
+        clearance: RiskClearance | None = None,
+    ) -> str:
         """Submit one leg as a market order and log the result.
+
+        The single choke point through which every order in this project passes.
+        It refuses to act without a :class:`RiskClearance` covering *this exact
+        order* -- see :mod:`pairs_trading.risk_manager` for why the interlock is
+        a token rather than a convention.
 
         Returns:
             The broker order id, or ``"DRY-RUN"``.
+
+        Raises:
+            RiskError: if the order has no valid risk clearance.
         """
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
+
+        # The interlock. Nothing reaches Alpaca without passing risk checks.
+        self.risk.require_clearance(_as_proposed(order), clearance)
 
         tif = TimeInForce.DAY if self.config.execution.time_in_force.lower() == "day" else TimeInForce.GTC
         request = MarketOrderRequest(
@@ -370,9 +484,10 @@ class AlpacaPaperTrader:
 
         if self.dry_run:
             order_id = "DRY-RUN"
-            logger.info(
-                "[DRY RUN] would %s %d %s (~$%.2f)",
+            logger.warning(
+                "[DRY RUN] WOULD HAVE PLACED ORDER: %s %d %s (~$%.2f) [risk clearance %s]",
                 order.side, order.quantity, order.ticker, order.notional,
+                clearance.token[:8] if clearance else "none",
             )
         else:
             try:
@@ -423,15 +538,29 @@ class AlpacaPaperTrader:
         * incoherent broker state (one leg only, or both legs same sign) ->
           flatten and take no new position this run
 
+        Risk clearance is obtained for each leg set *before any of it is sent*.
+        That atomicity is the whole point: clearing leg one, filling it, and
+        then having leg two rejected on an exposure cap would leave the account
+        holding a naked directional position.
+
         Args:
             data: Price history ending at the most recent completed bar.
 
         Returns:
-            A dict describing what was decided and submitted.
+            A dict describing what was decided and submitted. A risk rejection
+            is reported in ``action``/``rejected_reasons`` rather than raised,
+            so a scheduled run records the refusal and exits cleanly.
         """
+        # The circuit breaker runs before anything else, including the signal:
+        # if the day is already lost, there is nothing to decide.
+        breaker = self.enforce_daily_loss()
+        if breaker is not None:
+            return breaker
+
         signal = latest_signal(data, self.config)
         target = int(signal["target"])
         position = self.get_pair_position()
+        context = {"pair": str(self.config.pair), "zscore": signal.get("zscore", float("nan"))}
 
         result: dict[str, Any] = {
             "signal": signal,
@@ -442,6 +571,7 @@ class AlpacaPaperTrader:
             "action": "none",
             "orders": [],
             "dry_run": self.dry_run,
+            "rejected_reasons": [],
         }
 
         if not position.is_coherent:
@@ -451,10 +581,13 @@ class AlpacaPaperTrader:
                 self.config.pair.y, position.shares_y,
                 self.config.pair.x, position.shares_x,
             )
-            self.assert_market_open()
-            group = make_group_id(str(self.config.pair), utc_now_iso())
-            ids = [self._submit(o, signal, "exit", group) for o in self._build_close_orders(position)]
-            result.update(action="flatten_incoherent", orders=ids)
+            ids, reasons = self._submit_batch(
+                self._build_close_orders(position), signal, "exit", context
+            )
+            result.update(
+                action="flatten_incoherent" if not reasons else "rejected",
+                orders=ids, rejected_reasons=reasons,
+            )
             return result
 
         if target == position.direction:
@@ -464,8 +597,6 @@ class AlpacaPaperTrader:
             )
             return result
 
-        self.assert_market_open()
-        group = make_group_id(str(self.config.pair), utc_now_iso())
         submitted: list[str] = []
 
         if position.direction != 0:
@@ -473,8 +604,15 @@ class AlpacaPaperTrader:
                 "Closing %s (z=%+.2f, %s)", _label(position.direction),
                 signal["zscore"], signal["reason"] or "target changed",
             )
-            for order in self._build_close_orders(position):
-                submitted.append(self._submit(order, signal, "exit", group))
+            ids, reasons = self._submit_batch(
+                self._build_close_orders(position), signal, "exit", context
+            )
+            submitted += ids
+            if reasons:
+                # Could not flatten: do not stack a new position on top of one
+                # we failed to close.
+                result.update(action="rejected", orders=submitted, rejected_reasons=reasons)
+                return result
             result["action"] = "close"
 
         if target != 0:
@@ -484,27 +622,116 @@ class AlpacaPaperTrader:
                 signal["y_ticker"], signal["y_price"],
                 signal["x_ticker"], signal["x_price"],
             )
-            orders = self._build_pair_orders(
-                target, float(signal["y_price"]), float(signal["x_price"]),
-                float(signal["hedge_ratio"]),
-            )
-            for order in orders:
-                submitted.append(self._submit(order, signal, "entry", group))
-            result["action"] = "reverse" if position.direction != 0 else "open"
+            try:
+                orders = self._build_pair_orders(
+                    target, float(signal["y_price"]), float(signal["x_price"]),
+                    float(signal["hedge_ratio"]),
+                )
+            except ExecutionError as exc:
+                result.update(action="rejected", rejected_reasons=[str(exc)])
+                return result
+
+            ids, reasons = self._submit_batch(orders, signal, "entry", context)
+            submitted += ids
+            if reasons:
+                result["rejected_reasons"] = reasons
+                result["action"] = "rejected" if result["action"] == "none" else result["action"]
+            else:
+                result["action"] = "reverse" if position.direction != 0 else "open"
 
         result["orders"] = submitted
         return result
 
-    def close_all(self) -> list[str]:
-        """Flatten both legs of the pair unconditionally."""
+    def enforce_daily_loss(self) -> dict[str, Any] | None:
+        """Trip the circuit breaker if today's loss has breached the limit.
+
+        When it trips, :meth:`RiskManager.check_daily_loss` has already logged,
+        alerted and latched the halt flag. What remains is the config-driven
+        decision of whether to flatten, which is done here rather than inside
+        the risk manager so that the risk layer stays broker-agnostic.
+
+        Returns:
+            A result dict when the breaker tripped (the caller should stop), or
+            ``None`` to proceed.
+        """
+        snapshot = self.account_snapshot()
+        if not self.risk.check_daily_loss(snapshot):
+            return None
+
+        result: dict[str, Any] = {
+            "action": "circuit_breaker",
+            "orders": [],
+            "dry_run": self.dry_run,
+            "daily_pnl": snapshot.daily_pnl,
+            "halted": True,
+            "rejected_reasons": [
+                f"Daily loss limit breached (P&L ${snapshot.daily_pnl:,.2f}); trading halted."
+            ],
+        }
+
+        if self.config.risk.close_positions_on_breach:
+            logger.critical("Circuit breaker: closing all positions.")
+            try:
+                result["orders"] = self.close_all(reason="daily_loss_breach")
+                result["positions_closed"] = True
+            except ExecutionError as exc:
+                logger.critical("Circuit breaker could not flatten the book: %s", exc)
+                result["positions_closed"] = False
+                result["rejected_reasons"].append(f"close failed: {exc}")
+        else:
+            logger.critical(
+                "Circuit breaker tripped; positions left open "
+                "(risk.close_positions_on_breach is false)."
+            )
+            result["positions_closed"] = False
+
+        return result
+
+    def _submit_batch(
+        self, orders: list[LegOrder], signal: dict, intent: str, context: dict[str, Any]
+    ) -> tuple[list[str], list[str]]:
+        """Risk-check a whole leg set, then submit it only if the set cleared.
+
+        Returns:
+            ``(order_ids, rejection_reasons)``. A non-empty second element means
+            nothing was submitted.
+        """
+        if not orders:
+            return [], []
+
+        snapshot = self.account_snapshot()
+        try:
+            clearance = self.risk.validate_order(
+                orders_from_legs(orders), snapshot, intent=intent, context=context
+            )
+        except RiskRejection as exc:
+            logger.error(
+                "Risk layer BLOCKED %d %s leg(s): %s", len(orders), intent, "; ".join(exc.reasons)
+            )
+            return [], exc.reasons
+
+        group = make_group_id(str(self.config.pair), utc_now_iso())
+        return [self._submit(o, signal, intent, group, clearance) for o in orders], []
+
+    def close_all(self, reason: str = "manual_close") -> list[str]:
+        """Flatten both legs of the pair unconditionally.
+
+        Routed through the risk layer as an ``exit``, which skips the exposure
+        and loss-limit checks -- those exist to stop the book growing, and
+        applying them here would block the orders that shrink it.
+        """
         position = self.get_pair_position()
         if position.is_flat:
             logger.info("Already flat; nothing to close.")
             return []
-        self.assert_market_open()
-        signal = {"zscore": float("nan"), "reason": "manual_close"}
-        group = make_group_id(str(self.config.pair), utc_now_iso())
-        return [self._submit(o, signal, "exit", group) for o in self._build_close_orders(position)]
+        signal = {"zscore": float("nan"), "reason": reason}
+        ids, reasons = self._submit_batch(
+            self._build_close_orders(position), signal, "exit",
+            {"pair": str(self.config.pair), "detail": reason},
+        )
+        if reasons:
+            raise ExecutionError(f"Could not close positions: {'; '.join(reasons)}")
+        return ids
 
     def account_summary(self) -> str:
         """One-line description of the paper account and current pair exposure."""
@@ -522,6 +749,16 @@ class AlpacaPaperTrader:
 
 def _label(direction: int) -> str:
     return {1: "LONG SPREAD", -1: "SHORT SPREAD", 0: "FLAT"}.get(int(direction), "UNKNOWN")
+
+
+def _as_proposed(order: LegOrder) -> ProposedOrder:
+    """Adapt a single :class:`LegOrder` for the risk manager's clearance check."""
+    return ProposedOrder(
+        symbol=order.ticker,
+        side=order.side,
+        quantity=float(order.quantity),
+        price=float(order.reference_price),
+    )
 
 
 def build_trader(
