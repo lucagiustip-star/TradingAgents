@@ -392,6 +392,131 @@ class TestExecution:
             assert isinstance(o.quantity, int) and o.quantity >= 1
 
 
+class TestSetupDiagnostic:
+    """The read-only `--check-alpaca` setup check."""
+
+    def _diagnose(self, config, fake_alpaca, monkeypatch):
+        from unittest.mock import patch
+
+        from pairs_trading.execution_alpaca import diagnose
+
+        monkeypatch.setenv("ALPACA_API_KEY", "PKTEST1234567890")
+        monkeypatch.setenv("ALPACA_SECRET_KEY", "sk_secret_1234567890")
+        with patch("alpaca.trading.client.TradingClient", return_value=fake_alpaca):
+            return diagnose(config)
+
+    def _named(self, checks, name):
+        return next(c for c in checks if c.name == name)
+
+    def test_healthy_account_passes_every_check(self, config, fake_alpaca, monkeypatch):
+        fake_alpaca.get_account.return_value.shorting_enabled = True
+        fake_alpaca.get_account.return_value.multiplier = "2"
+        fake_alpaca.get_account.return_value.account_number = "PA123456789"
+        checks = self._diagnose(config, fake_alpaca, monkeypatch)
+        blocking = [c for c in checks if not c.ok and c.fatal]
+        assert blocking == [], [c.name for c in blocking]
+
+    def test_missing_credentials_stops_early_with_a_fix(self, config, monkeypatch):
+        from pairs_trading.execution_alpaca import diagnose
+
+        for var in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY",
+                    "APCA_API_KEY_ID", "APCA_API_SECRET_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr("pairs_trading.config.load_dotenv", lambda *a, **k: None,
+                            raising=False)
+        checks = diagnose(config)
+        cred = self._named(checks, "API credentials loaded")
+        assert cred.ok is False
+        assert "app.alpaca.markets" in cred.fix
+        # Nothing after the credential check should have run.
+        assert checks[-1] is cred
+
+    def test_credentials_are_masked_never_printed(self, config, fake_alpaca, monkeypatch):
+        checks = self._diagnose(config, fake_alpaca, monkeypatch)
+        detail = self._named(checks, "API credentials loaded").detail
+        assert "PKTEST1234567890" not in detail
+        assert "sk_secret_1234567890" not in detail
+        assert "*" in detail
+
+    def test_shorting_disabled_is_flagged_as_blocking(self, config, fake_alpaca, monkeypatch):
+        """A cash account cannot short, so no pairs trade can ever be placed."""
+        fake_alpaca.get_account.return_value.shorting_enabled = False
+        checks = self._diagnose(config, fake_alpaca, monkeypatch)
+        shorting = self._named(checks, "Shorting enabled")
+        assert shorting.ok is False and shorting.fatal
+        assert "margin" in shorting.fix.lower()
+
+    def test_cash_account_multiplier_is_flagged(self, config, fake_alpaca, monkeypatch):
+        fake_alpaca.get_account.return_value.shorting_enabled = True
+        fake_alpaca.get_account.return_value.multiplier = "1"
+        checks = self._diagnose(config, fake_alpaca, monkeypatch)
+        assert self._named(checks, "Margin account").ok is False
+
+    def test_insufficient_buying_power_is_non_blocking(self, config, fake_alpaca, monkeypatch):
+        fake_alpaca.get_account.return_value.buying_power = "10"
+        checks = self._diagnose(config, fake_alpaca, monkeypatch)
+        power = self._named(checks, "Buying power covers a trade")
+        assert power.ok is False and power.fatal is False
+
+    def test_halt_flag_is_surfaced(self, config, fake_alpaca, monkeypatch):
+        from pairs_trading.risk_manager import RiskManager
+
+        RiskManager(config).halt("earlier breach")
+        checks = self._diagnose(config, fake_alpaca, monkeypatch)
+        halted = self._named(checks, "Trading not halted")
+        assert halted.ok is False
+        assert "kill_switch --clear" in halted.fix
+
+    def test_live_endpoint_is_refused_before_connecting(self, config, monkeypatch):
+        """A live URL must fail the diagnostic without any network call."""
+        from dataclasses import replace
+
+        from pairs_trading.config import ExecutionConfig
+        from pairs_trading.execution_alpaca import diagnose
+
+        monkeypatch.setenv("ALPACA_API_KEY", "k")
+        monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+        # Bypass ExecutionConfig validation to simulate a tampered config.
+        bad = ExecutionConfig.__new__(ExecutionConfig)
+        object.__setattr__(bad, "base_url", "https://api.alpaca.markets")
+        for field_name, value in (
+            ("notional_per_leg", 1000.0), ("time_in_force", "day"),
+            ("require_market_open", True), ("verify_paper_account", True),
+        ):
+            object.__setattr__(bad, field_name, value)
+        checks = diagnose(replace(config, execution=bad))
+        endpoint = self._named(checks, "Endpoint is PAPER")
+        assert endpoint.ok is False
+        assert checks[-1] is endpoint
+
+    def test_report_renders_next_steps_on_success(self, config, fake_alpaca, monkeypatch):
+        from pairs_trading.execution_alpaca import render_diagnosis
+
+        fake_alpaca.get_account.return_value.shorting_enabled = True
+        fake_alpaca.get_account.return_value.multiplier = "2"
+        report = render_diagnosis(self._diagnose(config, fake_alpaca, monkeypatch), config)
+        assert "All checks passed" in report
+        assert "--paper-trade" in report and "--dry-run" in report
+
+    def test_report_names_the_blocking_count(self, config, fake_alpaca, monkeypatch):
+        from pairs_trading.execution_alpaca import render_diagnosis
+
+        fake_alpaca.get_account.return_value.shorting_enabled = False
+        report = render_diagnosis(self._diagnose(config, fake_alpaca, monkeypatch), config)
+        assert "blocking problem" in report
+
+    def test_diagnostic_places_no_orders(self, config, fake_alpaca, monkeypatch):
+        self._diagnose(config, fake_alpaca, monkeypatch)
+        fake_alpaca.submit_order.assert_not_called()
+        fake_alpaca.close_all_positions.assert_not_called()
+        fake_alpaca.cancel_orders.assert_not_called()
+
+    def test_cli_exposes_it_as_a_mode(self):
+        from pairs_trading.main import build_parser
+
+        assert build_parser().parse_args(["--check-alpaca"]).check_alpaca is True
+
+
 # --------------------------------------------------------------------------
 # strategy: spread and z-score
 # --------------------------------------------------------------------------

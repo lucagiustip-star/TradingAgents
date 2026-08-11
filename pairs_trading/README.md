@@ -43,17 +43,20 @@ python -m pairs_trading.main --backtest --pair KO/PEP
 # 3. Compare spread constructions and thresholds.
 python -m pairs_trading.main --backtest --pair GOOGL/MSFT --method log_ratio --entry-z 2.5
 
-# 4. Check the risk limits and halt state before going anywhere near the broker.
+# 4. Verify the Alpaca setup (read-only; places no orders).
+python -m pairs_trading.main --check-alpaca
+
+# 5. Check the risk limits and halt state before going anywhere near the broker.
 python -m pairs_trading.main --risk-status
 
-# 5. Paper trade — dry run first. Runs every risk check, submits nothing.
+# 6. Paper trade — dry run first. Runs every risk check, submits nothing.
 python -m pairs_trading.main --paper-trade --pair KO/PEP --dry-run
 python -m pairs_trading.main --paper-trade --pair KO/PEP
 
-# 6. Build the dashboard and open it.
+# 7. Build the dashboard and open it.
 python -m pairs_trading.main --dashboard --pair KO/PEP --open
 
-# 7. Emergency stop, any time.
+# 8. Emergency stop, any time.
 python -m pairs_trading.kill_switch --reason "stopping for the day"
 ```
 
@@ -252,7 +255,22 @@ broker. `--dry-run` runs the full pipeline including every risk check and logs
 `WOULD HAVE PLACED ORDER` instead of calling Alpaca — the way to exercise the
 risk layer in isolation.
 
-Exit codes: `3` halted, `4` circuit breaker tripped, `5` order rejected by risk.
+Exit codes: `3` halted, `4` circuit breaker tripped, `5` order rejected by risk,
+`6` setup check found only non-blocking issues.
+
+### Connecting to Alpaca
+
+```bash
+python -m pairs_trading.main --check-alpaca
+```
+
+A read-only diagnostic that walks the setup in dependency order and stops at the
+first blocking problem, so the output names the one thing to fix rather than
+cascading a missing credential into six confusing errors. It checks the SDK,
+credentials (masked in output, never printed), that the endpoint is the paper
+one, connectivity, account health, **that the account can sell short** — a cash
+account cannot, and every pairs trade shorts one leg — buying power against your
+configured trade size, the market clock, and the halt flag. It places no orders.
 
 ### Paper-trading guarantee
 

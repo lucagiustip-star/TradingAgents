@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Print the current risk limits and halt state, then exit.")
     mode.add_argument("--dashboard", action="store_true",
                       help="Build the HTML dashboard from the logs, risk state and a backtest.")
+    mode.add_argument("--check-alpaca", action="store_true",
+                      help="Verify the Alpaca paper setup end to end (read-only) and exit.")
 
     parser.add_argument("--pair", type=_parse_pair, metavar="Y/X",
                         help="Ticker pair, dependent leg first (e.g. KO/PEP).")
@@ -347,6 +349,23 @@ def _risk_summary(config: Config, trader) -> str:
         return f" Risk     : (could not read account state: {exc})"
 
 
+def cmd_check_alpaca(config: Config, args: argparse.Namespace) -> int:
+    """Run the read-only Alpaca setup diagnostic.
+
+    Exit 0 when everything passes, 1 when a blocking problem was found, 6 when
+    only non-blocking issues remain.
+    """
+    from .execution_alpaca import diagnose, render_diagnosis
+
+    checks = diagnose(config)
+    print(render_diagnosis(checks, config))
+
+    failures = [c for c in checks if not c.ok]
+    if not failures:
+        return 0
+    return 1 if any(c.fatal for c in failures) else 6
+
+
 def cmd_dashboard(config: Config, args: argparse.Namespace) -> int:
     """Build the HTML dashboard.
 
@@ -449,6 +468,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.risk_status:
             return cmd_risk_status(config, args)
+        if args.check_alpaca:
+            return cmd_check_alpaca(config, args)
         if args.dashboard:
             return cmd_dashboard(config, args)
         if args.check_only:

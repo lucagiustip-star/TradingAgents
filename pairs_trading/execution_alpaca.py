@@ -761,6 +761,258 @@ def _as_proposed(order: LegOrder) -> ProposedOrder:
     )
 
 
+@dataclass
+class Check:
+    """One step of the Alpaca setup diagnostic.
+
+    ``fix`` is the actionable next step when ``ok`` is False -- the whole point
+    of the diagnostic is that a failure tells you what to do, not just that
+    something is wrong.
+    """
+
+    name: str
+    ok: bool
+    detail: str = ""
+    fix: str = ""
+    fatal: bool = True      # a fatal failure stops the remaining checks
+    warning: bool = False   # ok, but worth knowing
+
+
+def _mask(secret: str) -> str:
+    """Show enough of a credential to identify it, never enough to use it."""
+    if not secret:
+        return "(empty)"
+    if len(secret) <= 8:
+        return "*" * len(secret)
+    return f"{secret[:4]}{'*' * (len(secret) - 8)}{secret[-4:]}"
+
+
+def diagnose(config: Config) -> list[Check]:
+    """Verify the Alpaca paper-trading setup end to end, read-only.
+
+    Runs through every prerequisite in dependency order and stops at the first
+    fatal failure, so the output names the one thing to fix rather than
+    cascading a single missing credential into six confusing errors.
+
+    Makes only read calls -- account, clock, positions. It never places,
+    modifies or cancels an order.
+
+    Returns:
+        The checks performed, in order. The last one is the first failure when
+        the run stopped early.
+    """
+    checks: list[Check] = []
+
+    # 1. SDK present
+    try:
+        import alpaca  # noqa: F401
+
+        version = getattr(alpaca, "__version__", "unknown")
+        checks.append(Check("alpaca-py installed", True, f"version {version}"))
+    except ImportError:
+        checks.append(Check(
+            "alpaca-py installed", False,
+            "the Alpaca SDK is not importable",
+            "pip install -r pairs_trading/requirements.txt",
+        ))
+        return checks
+
+    # 2. credentials present, and where they came from
+    #
+    # A missing .env is not itself a failure: keys may legitimately come from
+    # the shell, CI secrets, or a secrets manager. What matters is whether the
+    # credentials resolved, so this reports the source rather than demanding a
+    # particular one.
+    env_path = Path(config.source_path or ".").resolve().parent.parent / ".env"
+    try:
+        api_key, secret_key = alpaca_credentials()
+        source = f".env at {env_path}" if env_path.exists() else "the shell environment"
+        checks.append(Check(
+            "API credentials loaded", True,
+            f"key {_mask(api_key)}, secret {_mask(secret_key)} (from {source})",
+        ))
+    except Exception as exc:
+        checks.append(Check(
+            "API credentials loaded", False, str(exc),
+            f"cp pairs_trading/.env.example {env_path}\n"
+            "then set ALPACA_API_KEY and ALPACA_SECRET_KEY to PAPER keys from "
+            "https://app.alpaca.markets/paper/dashboard/overview",
+        ))
+        return checks
+
+    # 4. endpoint is the paper endpoint
+    try:
+        assert_paper_endpoint(config.execution.base_url)
+        checks.append(Check(
+            "Endpoint is PAPER", True, config.execution.base_url,
+        ))
+    except LiveTradingBlockedError as exc:
+        checks.append(Check(
+            "Endpoint is PAPER", False, str(exc),
+            f"Set execution.base_url to {PAPER_URL} in pairs_trading/config.yaml",
+        ))
+        return checks
+
+    # 5. client constructs and the account is reachable
+    try:
+        trader = AlpacaPaperTrader(config, trade_logger=None, dry_run=True)
+        checks.append(Check(
+            "Connected to Alpaca", True, f"resolved endpoint {trader.base_url}",
+        ))
+    except ExecutionError as exc:
+        message = str(exc)
+        fix = (
+            "Your keys were rejected. The most common cause is using LIVE keys against the "
+            "paper endpoint -- they are different credentials. Regenerate PAPER keys at "
+            "https://app.alpaca.markets/paper/dashboard/overview"
+            if "40" in message or "auth" in message.lower() or "forbidden" in message.lower()
+            else "Check network access to paper-api.alpaca.markets."
+        )
+        checks.append(Check("Connected to Alpaca", False, message, fix))
+        return checks
+    except Exception as exc:
+        checks.append(Check("Connected to Alpaca", False, str(exc),
+                            "Check network access to paper-api.alpaca.markets."))
+        return checks
+
+    account = trader.account
+
+    def attr(name: str, default: Any = None) -> Any:
+        return getattr(account, name, default)
+
+    # 6. account identity and health
+    number = str(attr("account_number", "") or "")
+    checks.append(Check(
+        "Paper account active", True,
+        f"account {_mask(number)}, status {attr('status', '?')}, "
+        f"equity ${float(attr('equity', 0) or 0):,.2f}, "
+        f"buying power ${float(attr('buying_power', 0) or 0):,.2f}",
+    ))
+
+    # 7. shorting -- the one that silently breaks pairs trading
+    shorting = attr("shorting_enabled", None)
+    if shorting is False:
+        checks.append(Check(
+            "Shorting enabled", False,
+            "the account reports shorting_enabled=false",
+            "Every pairs trade shorts one leg, so this strategy cannot run without it. "
+            "A cash account cannot short -- reset the paper account as MARGIN at "
+            "https://app.alpaca.markets/paper/dashboard/overview",
+        ))
+    elif shorting is None:
+        checks.append(Check(
+            "Shorting enabled", True, "not reported by this SDK version", warning=True,
+        ))
+    else:
+        checks.append(Check("Shorting enabled", True, "account may sell short"))
+
+    multiplier = str(attr("multiplier", "") or "")
+    if multiplier == "1":
+        checks.append(Check(
+            "Margin account", False,
+            "multiplier=1, which indicates a cash account",
+            "Cash accounts cannot sell short. Reset the paper account as a margin account.",
+            fatal=False,
+        ))
+
+    # 8. buying power against the configured trade size
+    needed = 2 * config.execution.notional_per_leg
+    power = float(attr("buying_power", 0) or 0)
+    if power < needed:
+        checks.append(Check(
+            "Buying power covers a trade", False,
+            f"one pair entry needs about ${needed:,.2f}, account has ${power:,.2f}",
+            "Lower execution.notional_per_leg in config.yaml, or reset the paper account "
+            "to restore its starting balance.",
+            fatal=False,
+        ))
+    else:
+        checks.append(Check(
+            "Buying power covers a trade", True,
+            f"${power:,.2f} available, one entry needs about ${needed:,.2f}",
+        ))
+
+    # 9. market clock
+    try:
+        clock = trader.client.get_clock()
+        is_open = bool(getattr(clock, "is_open", False))
+        detail = (
+            "market is OPEN" if is_open
+            else f"market is CLOSED, next open {getattr(clock, 'next_open', 'unknown')}"
+        )
+        checks.append(Check("Market clock readable", True, detail, warning=not is_open,
+                            fix="" if is_open else
+                            "Orders are rejected while closed by default "
+                            "(risk.require_market_open). This is not a setup problem."))
+    except Exception as exc:
+        checks.append(Check("Market clock readable", False, str(exc), "", fatal=False))
+
+    # 10. positions readable
+    try:
+        position = trader.get_pair_position()
+        checks.append(Check(
+            "Positions readable", True,
+            f"{config.pair.y} {position.shares_y:+,.0f}, {config.pair.x} {position.shares_x:+,.0f} "
+            f"({_label(position.direction)})",
+        ))
+    except ExecutionError as exc:
+        checks.append(Check("Positions readable", False, str(exc), "", fatal=False))
+
+    # 11. risk layer state
+    if trader.risk.is_halted():
+        checks.append(Check(
+            "Trading not halted", False,
+            f"TRADING_HALTED is set: {trader.risk.halt_reason()}",
+            "python -m pairs_trading.kill_switch --clear",
+            fatal=False,
+        ))
+    else:
+        checks.append(Check("Trading not halted", True, "no halt flag"))
+
+    return checks
+
+
+def render_diagnosis(checks: list[Check], config: Config) -> str:
+    """Format :func:`diagnose` output as a console report."""
+    width = 74
+    lines = ["=" * width, " ALPACA PAPER TRADING -- SETUP CHECK", "=" * width]
+
+    failures = [c for c in checks if not c.ok]
+    for check in checks:
+        if not check.ok:
+            mark = "[FAIL]"
+        elif check.warning:
+            mark = "[warn]"
+        else:
+            mark = "[ok]  "
+        lines.append(f" {mark} {check.name}")
+        if check.detail:
+            lines.append(f"        {check.detail}")
+        if check.fix and (not check.ok or check.warning):
+            for i, part in enumerate(check.fix.split("\n")):
+                lines.append(f"        {'-> ' if i == 0 else '   '}{part}")
+
+    lines.append("")
+    hard = [c for c in failures if c.fatal]
+    if not failures:
+        lines += [
+            " All checks passed. You are ready to paper trade.",
+            "",
+            " Next:",
+            f"   python -m pairs_trading.main --check-only  --pair {config.pair}",
+            f"   python -m pairs_trading.main --paper-trade --pair {config.pair} --dry-run",
+            f"   python -m pairs_trading.main --paper-trade --pair {config.pair}",
+        ]
+    elif hard:
+        lines.append(f" {len(hard)} blocking problem(s). Fix the first one and re-run.")
+    else:
+        lines.append(
+            f" {len(failures)} non-blocking issue(s). You can trade, but read them first."
+        )
+    lines.append("=" * width)
+    return "\n".join(lines)
+
+
 def build_trader(
     config: Config, log_path: str | Path | None = None, dry_run: bool = False
 ) -> AlpacaPaperTrader:
