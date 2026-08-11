@@ -576,11 +576,58 @@ def resolve_path(path: str | Path, base: Path | None = None) -> Path:
     return (base or PACKAGE_DIR.parent) / p
 
 
+def dotenv_search_paths() -> list[Path]:
+    """Locations searched for a ``.env`` file, in precedence order.
+
+    The repository root is canonical, but ``.env.example`` ships inside the
+    package, so copying it in place -- the obvious thing to do -- lands the file
+    beside the template rather than at the root. Searching both means that
+    reasonable mistake just works instead of failing with an unhelpful "missing
+    credential". The working directory is included last for the case where the
+    package is pip-installed and there is no repo checkout at all.
+    """
+    candidates = [
+        PACKAGE_DIR.parent / ".env",   # repository root (canonical)
+        PACKAGE_DIR / ".env",          # beside .env.example (the easy mistake)
+        Path.cwd() / ".env",           # wherever the command was run
+    ]
+    seen: list[Path] = []
+    for path in candidates:
+        if path not in seen:
+            seen.append(path)
+    return seen
+
+
+def find_dotenv() -> Path | None:
+    """Return the first existing ``.env``, or ``None``."""
+    for path in dotenv_search_paths():
+        if path.is_file():
+            return path
+    return None
+
+
+def load_dotenv_file() -> Path | None:
+    """Load the first ``.env`` found. Returns the path used, or ``None``."""
+    path = find_dotenv()
+    if path is None:
+        return None
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(path)
+    except ImportError:  # pragma: no cover - dotenv is a declared dependency
+        return None
+    return path
+
+
 def alpaca_credentials() -> tuple[str, str]:
     """Read Alpaca paper-trading credentials from the environment.
 
-    Loads ``.env`` (via python-dotenv) if present, then reads the key/secret.
-    Alpaca's own SDK naming has drifted over versions, so both the current
+    Loads a ``.env`` file if one is found (see :func:`dotenv_search_paths`),
+    then reads the key/secret. Real environment variables always win over the
+    file, so CI secrets and shell exports are not overridden by a stale ``.env``.
+
+    Alpaca's own SDK naming has drifted across versions, so both the current
     ``ALPACA_API_KEY``/``ALPACA_SECRET_KEY`` and the older
     ``APCA_API_KEY_ID``/``APCA_API_SECRET_KEY`` spellings are accepted.
 
@@ -588,22 +635,26 @@ def alpaca_credentials() -> tuple[str, str]:
         ``(api_key, secret_key)``.
 
     Raises:
-        ConfigError: if either credential is missing.
+        ConfigError: if either credential is missing, naming every location
+            searched so the fix is obvious.
     """
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv(PACKAGE_DIR.parent / ".env")
-    except ImportError:  # pragma: no cover - dotenv is a declared dependency
-        pass
+    load_dotenv_file()
 
     key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
     secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
     missing = [n for n, v in (("ALPACA_API_KEY", key), ("ALPACA_SECRET_KEY", secret)) if not v]
     if missing:
+        found = find_dotenv()
+        where = (
+            f"Found a .env at {found}, but it does not set {' and '.join(missing)}."
+            if found
+            else "No .env file was found. Searched:\n    "
+            + "\n    ".join(str(p) for p in dotenv_search_paths())
+        )
         raise ConfigError(
-            f"Missing Alpaca credential(s): {', '.join(missing)}. "
-            "Copy pairs_trading/.env.example to .env at the repo root and fill in your "
-            "PAPER trading keys from https://app.alpaca.markets/paper/dashboard/overview"
+            f"Missing Alpaca credential(s): {', '.join(missing)}.\n{where}\n"
+            f"Fix:  cp {PACKAGE_DIR / '.env.example'} {PACKAGE_DIR.parent / '.env'}\n"
+            "then edit that file and set your PAPER keys from "
+            "https://app.alpaca.markets/paper/dashboard/overview"
         )
     return key, secret

@@ -517,6 +517,98 @@ class TestSetupDiagnostic:
         assert build_parser().parse_args(["--check-alpaca"]).check_alpaca is True
 
 
+class TestDotenvDiscovery:
+    """Where `.env` is looked for. The commonest setup mistake lives here."""
+
+    def _clear(self, monkeypatch):
+        for var in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY",
+                    "APCA_API_KEY_ID", "APCA_API_SECRET_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_repo_root_is_searched_first(self):
+        from pairs_trading.config import PACKAGE_DIR, dotenv_search_paths
+
+        assert dotenv_search_paths()[0] == PACKAGE_DIR.parent / ".env"
+
+    def test_package_dir_is_searched_too(self):
+        """`.env.example` ships in the package, so copying it in place is the
+        obvious move and must not silently fail."""
+        from pairs_trading.config import PACKAGE_DIR, dotenv_search_paths
+
+        assert PACKAGE_DIR / ".env" in dotenv_search_paths()
+
+    def test_credentials_load_from_a_discovered_env_file(self, tmp_path, monkeypatch):
+        from pairs_trading import config as config_module
+
+        self._clear(monkeypatch)
+        env = tmp_path / ".env"
+        env.write_text("ALPACA_API_KEY=PKFROMFILE\nALPACA_SECRET_KEY=skfromfile\n")
+        monkeypatch.setattr(config_module, "dotenv_search_paths", lambda: [env])
+
+        key, secret = config_module.alpaca_credentials()
+        assert key == "PKFROMFILE"
+        assert secret == "skfromfile"
+
+    def test_real_env_vars_beat_a_stale_env_file(self, tmp_path, monkeypatch):
+        """CI secrets and shell exports must not be overridden by a leftover file."""
+        from pairs_trading import config as config_module
+
+        env = tmp_path / ".env"
+        env.write_text("ALPACA_API_KEY=FROMFILE\nALPACA_SECRET_KEY=fromfile\n")
+        monkeypatch.setattr(config_module, "dotenv_search_paths", lambda: [env])
+        monkeypatch.setenv("ALPACA_API_KEY", "FROMSHELL")
+        monkeypatch.setenv("ALPACA_SECRET_KEY", "fromshell")
+
+        key, _ = config_module.alpaca_credentials()
+        assert key == "FROMSHELL"
+
+    def test_missing_env_error_lists_every_location_searched(self, tmp_path, monkeypatch):
+        from pairs_trading import config as config_module
+        from pairs_trading.config import ConfigError
+
+        self._clear(monkeypatch)
+        monkeypatch.setattr(
+            config_module, "dotenv_search_paths",
+            lambda: [tmp_path / "a" / ".env", tmp_path / "b" / ".env"],
+        )
+        with pytest.raises(ConfigError) as exc:
+            config_module.alpaca_credentials()
+        message = str(exc.value)
+        assert "No .env file was found" in message
+        assert str(tmp_path / "a" / ".env") in message
+        assert str(tmp_path / "b" / ".env") in message
+
+    def test_present_but_empty_env_says_so(self, tmp_path, monkeypatch):
+        """An empty .env is a different problem from a missing one."""
+        from pairs_trading import config as config_module
+        from pairs_trading.config import ConfigError
+
+        self._clear(monkeypatch)
+        env = tmp_path / ".env"
+        env.write_text("ALPACA_API_KEY=\nALPACA_SECRET_KEY=\n")
+        monkeypatch.setattr(config_module, "dotenv_search_paths", lambda: [env])
+
+        with pytest.raises(ConfigError) as exc:
+            config_module.alpaca_credentials()
+        assert "Found a .env at" in str(exc.value)
+        assert "does not set" in str(exc.value)
+
+    def test_legacy_apca_names_still_work(self, monkeypatch):
+        from pairs_trading import config as config_module
+
+        self._clear(monkeypatch)
+        monkeypatch.setattr(config_module, "dotenv_search_paths", lambda: [])
+        monkeypatch.setenv("APCA_API_KEY_ID", "PKLEGACY")
+        monkeypatch.setenv("APCA_API_SECRET_KEY", "sklegacy")
+        assert config_module.alpaca_credentials()[0] == "PKLEGACY"
+
+    def test_env_example_is_not_itself_a_dotenv(self):
+        """`.env.example` must never be picked up as real credentials."""
+        from pairs_trading.config import dotenv_search_paths
+
+        assert all(p.name == ".env" for p in dotenv_search_paths())
+
+
 # --------------------------------------------------------------------------
 # strategy: spread and z-score
 # --------------------------------------------------------------------------

@@ -823,10 +823,12 @@ def diagnose(config: Config) -> list[Check]:
     # the shell, CI secrets, or a secrets manager. What matters is whether the
     # credentials resolved, so this reports the source rather than demanding a
     # particular one.
-    env_path = Path(config.source_path or ".").resolve().parent.parent / ".env"
+    from .config import PACKAGE_DIR, find_dotenv
+
     try:
         api_key, secret_key = alpaca_credentials()
-        source = f".env at {env_path}" if env_path.exists() else "the shell environment"
+        env_path = find_dotenv()
+        source = f".env at {env_path}" if env_path else "the shell environment"
         checks.append(Check(
             "API credentials loaded", True,
             f"key {_mask(api_key)}, secret {_mask(secret_key)} (from {source})",
@@ -834,9 +836,9 @@ def diagnose(config: Config) -> list[Check]:
     except Exception as exc:
         checks.append(Check(
             "API credentials loaded", False, str(exc),
-            f"cp pairs_trading/.env.example {env_path}\n"
-            "then set ALPACA_API_KEY and ALPACA_SECRET_KEY to PAPER keys from "
-            "https://app.alpaca.markets/paper/dashboard/overview",
+            f"cp {PACKAGE_DIR / '.env.example'} {PACKAGE_DIR.parent / '.env'}\n"
+            "then edit that file and set ALPACA_API_KEY and ALPACA_SECRET_KEY to PAPER "
+            "keys from https://app.alpaca.markets/paper/dashboard/overview",
         ))
         return checks
 
