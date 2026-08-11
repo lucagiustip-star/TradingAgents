@@ -44,15 +44,30 @@ dev = [
 bedrock = [
     "langchain-aws>=1.5.0",
 ]
+# Statistical-arbitrage (pairs trading) subsystem: pip install ".[pairs]".
+# Optional so the core install stays lean -- statsmodels, matplotlib and the
+# Alpaca SDK are only needed for this subsystem. Exact pins for a reproducible
+# backtest live in pairs_trading/requirements.txt.
+pairs = [
+    "statsmodels>=0.14.4",
+    "scipy>=1.15.0",
+    "matplotlib>=3.10.0",
+    "PyYAML>=6.0.2",
+    "alpaca-py>=0.33.1",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
+pairs-trading = "pairs_trading.main:main"
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "pairs_trading*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
+# load_config() reads config.yaml from beside the module, so it must be
+# installed alongside it rather than left behind in the source tree.
+pairs_trading = ["config.yaml", ".env.example"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

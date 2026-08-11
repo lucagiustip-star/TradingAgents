@@ -1,0 +1,32 @@
+# Pinned dependencies for the pairs-trading (statistical arbitrage) system.
+#
+#   pip install -r pairs_trading/requirements.txt
+#
+# These are pinned exactly so a backtest run today reproduces next year. The
+# numeric stack in particular is worth pinning: statsmodels' cointegration
+# critical-value tables and its default lag-selection behaviour have changed
+# across releases, so an unpinned upgrade can flip a marginal pair's verdict.
+
+# --- numerical / data ---
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.15.3
+
+# --- statistics: ADF, Engle-Granger, Johansen, rolling OLS ---
+statsmodels==0.14.4
+
+# --- market data (backtesting; free, no API key) ---
+yfinance==0.2.54
+
+# --- charting ---
+matplotlib==3.10.0
+
+# --- configuration ---
+PyYAML==6.0.2
+python-dotenv==1.0.1
+
+# --- broker: Alpaca PAPER trading only ---
+alpaca-py==0.33.1
+
+# --- tests ---
+pytest==8.3.4

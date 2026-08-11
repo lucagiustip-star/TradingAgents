@@ -1,0 +1,319 @@
+"""CLI entry point for the pairs-trading system.
+
+Usage::
+
+    python -m pairs_trading.main --backtest --pair KO/PEP
+    python -m pairs_trading.main --backtest --pair GOOGL/MSFT --method log_ratio --entry-z 2.5
+    python -m pairs_trading.main --check-only --pair KO/PEP
+    python -m pairs_trading.main --paper-trade --pair KO/PEP --dry-run
+
+Exactly one mode must be chosen. Every strategy parameter has a config-file
+default and an optional flag that overrides it, so a parameter sweep is a shell
+loop rather than a series of edits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from .config import NULL, Config, ConfigError, load_config, resolve_path
+
+logger = logging.getLogger("pairs_trading")
+
+
+def _parse_pair(value: str) -> tuple[str, str]:
+    """Parse a ``Y/X`` (or ``Y,X`` / ``Y:X``) pair specification."""
+    for sep in ("/", ",", ":"):
+        if sep in value:
+            parts = [p.strip().upper() for p in value.split(sep) if p.strip()]
+            if len(parts) == 2:
+                return parts[0], parts[1]
+            break
+    raise argparse.ArgumentTypeError(
+        f"--pair expects two tickers separated by '/', e.g. KO/PEP; got {value!r}."
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pairs_trading",
+        description="Statistical arbitrage (pairs trading): backtest and Alpaca PAPER trading.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Safety: this tool trades ONLY against Alpaca's paper endpoint. There is no\n"
+            "live-order code path, and the configured base URL must contain 'paper'.\n"
+        ),
+    )
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--backtest", action="store_true",
+                      help="Run the historical backtest and print metrics.")
+    mode.add_argument("--paper-trade", action="store_true",
+                      help="Reconcile the Alpaca PAPER account to the current signal.")
+    mode.add_argument("--check-only", action="store_true",
+                      help="Run the cointegration tests and exit without trading.")
+    mode.add_argument("--close-all", action="store_true",
+                      help="Flatten both legs of the pair on the PAPER account and exit.")
+
+    parser.add_argument("--pair", type=_parse_pair, metavar="Y/X",
+                        help="Ticker pair, dependent leg first (e.g. KO/PEP).")
+    parser.add_argument("--config", type=Path, help="Path to config.yaml.")
+
+    data = parser.add_argument_group("data")
+    data.add_argument("--start", help="History start date, YYYY-MM-DD.")
+    data.add_argument("--end", help="History end date, YYYY-MM-DD.")
+    data.add_argument("--no-cache", action="store_true", help="Bypass the on-disk price cache.")
+    data.add_argument("--csv", type=Path,
+                      help="Load prices from a local CSV instead of Yahoo Finance.")
+
+    spread = parser.add_argument_group("spread")
+    spread.add_argument("--method", choices=["price_diff", "log_ratio", "ols"],
+                        help="Spread construction method.")
+    spread.add_argument("--hedge-window", type=int,
+                        help="Rolling window for the OLS hedge ratio (0 = static full-sample).")
+    spread.add_argument("--log-prices", action="store_true",
+                        help="Fit the hedge ratio on log prices.")
+
+    signal = parser.add_argument_group("signal")
+    signal.add_argument("--zscore-window", type=int, help="Rolling z-score window in bars.")
+    signal.add_argument("--entry-z", type=float, help="|z| at which to open a position.")
+    signal.add_argument("--exit-z", type=float, help="|z| at which to close it.")
+    signal.add_argument("--stop-z", type=float, help="|z| at which to stop out.")
+    signal.add_argument("--max-hold", type=int, help="Time stop, in bars.")
+    signal.add_argument("--execution-lag", type=int,
+                        help="Bars between signal and fill (default 1; 0 is look-ahead).")
+
+    bt = parser.add_argument_group("backtest")
+    bt.add_argument("--capital", type=float, help="Initial capital.")
+    bt.add_argument("--exposure", type=float, help="Dollar notional committed per leg.")
+    bt.add_argument("--sizing", choices=["dollar_neutral", "beta_neutral"], help="Sizing rule.")
+    bt.add_argument("--commission-bps", type=float, help="Commission per leg, in bps.")
+    bt.add_argument("--slippage-bps", type=float, help="Slippage per leg, in bps.")
+
+    coint = parser.add_argument_group("cointegration")
+    coint.add_argument("--coint-method", choices=["engle_granger", "johansen", "both"],
+                       help="Which cointegration test(s) to run.")
+    coint.add_argument("--significance", type=float, help="Significance level (default 0.05).")
+    coint.add_argument("--force", action="store_true",
+                       help="Run even if the pair FAILS the cointegration gate. The results "
+                            "will have no statistical basis; use only for investigation.")
+
+    out = parser.add_argument_group("output")
+    out.add_argument("--no-plot", action="store_true", help="Skip the matplotlib chart.")
+    out.add_argument("--show-plot", action="store_true", help="Open the chart interactively.")
+    out.add_argument("--plot-output", help="Path for the chart PNG.")
+    out.add_argument("--trade-log", help="Path for the CSV trade log.")
+    out.add_argument("--trades", action="store_true", help="Print the full round-trip ledger.")
+    out.add_argument("--verbose", "-v", action="store_true", help="Debug-level logging.")
+    out.add_argument("--quiet", "-q", action="store_true", help="Warnings and errors only.")
+
+    live = parser.add_argument_group("paper trading")
+    live.add_argument("--dry-run", action="store_true",
+                      help="Compute orders and log them without submitting to Alpaca.")
+
+    return parser
+
+
+def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
+    """Layer CLI flags on top of the loaded config file."""
+    pair = {}
+    if args.pair:
+        pair = {"y": args.pair[0], "x": args.pair[1]}
+
+    data = {"start": args.start, "end": args.end}
+    if args.no_cache:
+        data["use_cache"] = False
+
+    spread = {"method": args.method}
+    if args.hedge_window is not None:
+        # 0 is the CLI spelling of "static full-sample beta" (YAML null); NULL
+        # is the sentinel that survives with_overrides' drop-None filtering.
+        spread["hedge_window"] = NULL if args.hedge_window == 0 else args.hedge_window
+    if args.log_prices:
+        spread["use_log_prices"] = True
+
+    signal = {
+        "zscore_window": args.zscore_window,
+        "entry_z": args.entry_z,
+        "exit_z": args.exit_z,
+        "stop_z": args.stop_z,
+        "max_holding_days": args.max_hold,
+        "execution_lag": args.execution_lag,
+    }
+
+    backtest = {
+        "initial_capital": args.capital,
+        "gross_exposure_per_leg": args.exposure,
+        "sizing": args.sizing,
+        "commission_bps": args.commission_bps,
+        "slippage_bps": args.slippage_bps,
+    }
+
+    coint = {"method": args.coint_method, "significance": args.significance}
+    if args.force:
+        coint["enforce"] = False
+
+    plot = {"output": args.plot_output}
+    if args.no_plot:
+        plot["enabled"] = False
+    if args.show_plot:
+        plot["show"] = True
+
+    logging_cfg = {"trade_log": args.trade_log}
+
+    return config.with_overrides(
+        pair=pair, data=data, spread=spread, signal=signal,
+        backtest=backtest, cointegration=coint, plot=plot, logging=logging_cfg,
+    )
+
+
+def setup_logging(args: argparse.Namespace) -> None:
+    level = logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)-7s %(name)s: %(message)s")
+    # yfinance is chatty at INFO and its progress noise obscures our own output.
+    logging.getLogger("yfinance").setLevel(logging.WARNING)
+    logging.getLogger("peewee").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def _load_data(config: Config, args: argparse.Namespace):
+    from .data import fetch_pair, load_prices_csv
+
+    if args.csv:
+        return load_prices_csv(args.csv, config.pair)
+    return fetch_pair(config)
+
+
+def _run_cointegration(data, config: Config, args: argparse.Namespace):
+    """Run the gate and print the report. Returns the result."""
+    from .cointegration import assert_tradeable, test_pair
+
+    result = test_pair(data, config)
+    print(result.report())
+
+    if not result.is_cointegrated and args.force:
+        print(
+            "\n!! --force is set: continuing on a pair that FAILED the cointegration gate.\n"
+            "!! The spread has no demonstrated equilibrium, so any P&L below is a property\n"
+            "!! of this particular sample and should not be read as an edge.\n"
+        )
+    assert_tradeable(result, config)
+    return result
+
+
+def cmd_check(config: Config, args: argparse.Namespace) -> int:
+    data = _load_data(config, args)
+    result = _run_cointegration(data, config, args)
+    return 0 if result.is_cointegrated else 1
+
+
+def cmd_backtest(config: Config, args: argparse.Namespace) -> int:
+    from .backtest import plot_results, run_backtest
+    from .strategy import generate_signals
+    from .trade_log import TradeLogger
+
+    data = _load_data(config, args)
+    _run_cointegration(data, config, args)
+
+    signals = generate_signals(data, config)
+    log_path = resolve_path(config.logging.trade_log)
+    trade_logger = TradeLogger(log_path, mode="backtest")
+
+    result = run_backtest(data, signals, config, trade_logger)
+    print()
+    print(result.summary())
+    print(f"\n Trade log: {log_path}  ({trade_logger.count} legs)")
+
+    if args.trades and result.trades:
+        import pandas as pd
+
+        with pd.option_context("display.width", 200, "display.max_columns", 20):
+            print("\n Round trips")
+            print(result.trades_frame.to_string(float_format=lambda v: f"{v:,.4f}"))
+
+    if config.plot.enabled:
+        plot_results(result, config.plot.output, config.plot.show)
+        print(f" Chart    : {resolve_path(config.plot.output)}")
+
+    return 0
+
+
+def cmd_paper_trade(config: Config, args: argparse.Namespace) -> int:
+    from .execution_alpaca import build_trader
+
+    data = _load_data(config, args)
+    _run_cointegration(data, config, args)
+
+    trader = build_trader(config, config.logging.trade_log, dry_run=args.dry_run)
+    print()
+    print(trader.account_summary())
+    print()
+
+    outcome = trader.sync_to_signal(data)
+    signal = outcome["signal"]
+    print(
+        f" Signal   : {signal['date']}  z={signal['zscore']:+.3f}  "
+        f"target={outcome['target_direction']:+d}  ({signal['reason'] or 'no change'})"
+    )
+    print(f" Action   : {outcome['action']}")
+    if outcome["orders"]:
+        print(f" Orders   : {', '.join(outcome['orders'])}")
+    if args.dry_run:
+        print(" (dry run -- nothing was submitted)")
+    return 0
+
+
+def cmd_close_all(config: Config, args: argparse.Namespace) -> int:
+    from .execution_alpaca import build_trader
+
+    trader = build_trader(config, config.logging.trade_log, dry_run=args.dry_run)
+    print(trader.account_summary())
+    ids = trader.close_all()
+    print(f"\n Closed {len(ids)} leg(s): {', '.join(ids) if ids else 'nothing to close'}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    setup_logging(args)
+
+    try:
+        config = apply_overrides(load_config(args.config), args)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    for note in config.advisories():
+        logger.warning("Config advisory: %s", note)
+
+    try:
+        if args.check_only:
+            return cmd_check(config, args)
+        if args.backtest:
+            return cmd_backtest(config, args)
+        if args.paper_trade:
+            return cmd_paper_trade(config, args)
+        if args.close_all:
+            return cmd_close_all(config, args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        # Surface the failure class, since "not cointegrated" and "network down"
+        # call for very different responses.
+        print(f"\n{type(exc).__name__}: {exc}", file=sys.stderr)
+        if args.verbose:
+            raise
+        print("\n(Re-run with --verbose for the full traceback.)", file=sys.stderr)
+        return 1
+
+    parser.error("No mode selected.")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

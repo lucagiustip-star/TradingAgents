@@ -1,0 +1,120 @@
+# ---------------------------------------------------------------------------
+# Pairs-trading (statistical arbitrage) configuration.
+#
+# Every tunable number the strategy uses lives here. `strategy.py` contains no
+# hard-coded thresholds or window lengths -- it receives a StrategyConfig built
+# from this file, so a parameter sweep never requires editing Python.
+#
+# CLI flags (see `python -m pairs_trading.main --help`) override anything here,
+# and a few settings can also come from the environment; the precedence order is
+#     CLI flag  >  environment variable  >  this file  >  built-in default
+# ---------------------------------------------------------------------------
+
+pair:
+  # The pair is ordered: `y` is the dependent leg, `x` the independent one.
+  # The hedge ratio beta is estimated by regressing y on x, so swapping the two
+  # gives a different (roughly reciprocal) beta and a different spread series.
+  y: KO
+  x: PEP
+
+data:
+  start: "2015-01-01"
+  end: null              # null => today
+  interval: "1d"
+  # "close" uses split/dividend-adjusted closes (yfinance auto_adjust=True).
+  # Adjusted prices are the right input for a total-return backtest; raw closes
+  # would show fake jumps on ex-dividend dates that the spread would read as
+  # divergence.
+  price_field: "close"
+  cache_dir: ".cache/pairs_data"
+  use_cache: true
+  max_cache_age_hours: 12
+  min_observations: 252   # refuse to model a pair with less than ~1y of data
+
+spread:
+  # How the two price series are collapsed into one mean-reverting series:
+  #   price_diff -> S = Py - Px                (1:1 shares, no hedge ratio)
+  #   log_ratio  -> S = ln(Py) - ln(Px)        (scale-free, 1:1 in % terms)
+  #   ols        -> S = Py - (alpha + beta*Px) (regression residual)
+  method: "ols"
+  # Rolling window (bars) for the OLS hedge ratio. null => one static beta
+  # fitted on the whole sample, which leaks future information into the
+  # backtest; keep a finite window for any result you intend to believe.
+  hedge_window: 60
+  # Fit the OLS hedge ratio on log prices instead of raw prices. Makes beta an
+  # elasticity (a % move in x maps to beta% in y) and stabilises it when the
+  # price levels of the two legs drift far apart over a long sample.
+  use_log_prices: false
+
+signal:
+  # Rolling window for the z-score of the spread. The strategy's headline
+  # parameter: short windows trade often and react to fresh dislocations, long
+  # windows trade rarely and assume a slower-moving equilibrium.
+  zscore_window: 20
+  entry_z: 2.0     # |z| >= entry_z opens a position (fade the divergence)
+  exit_z: 0.25     # |z| <= exit_z closes it (mean reversion realised)
+  stop_z: 3.5      # |z| >= stop_z force-closes it (relationship broke)
+  max_holding_days: null   # optional time stop; null disables it
+  # Bars between signal and fill. 1 = a signal computed from today's close is
+  # executed at tomorrow's close. Setting this to 0 lets the backtest trade on
+  # a price it could not have known, which inflates every metric.
+  execution_lag: 1
+
+cointegration:
+  # engle_granger | johansen | both
+  method: "both"
+  significance: 0.05
+  # When true, a pair that fails the test aborts the run instead of quietly
+  # backtesting a spread with no equilibrium to revert to.
+  enforce: true
+  # Optional sanity band on the fitted mean-reversion half-life, in bars.
+  #
+  # Kept at or below signal.zscore_window on purpose: a spread that takes longer
+  # to revert than the window measuring it has its own drift absorbed into the
+  # rolling mean, so genuine dislocations can read as z~0 and the strategy never
+  # fires. Raising this without also lengthening zscore_window admits pairs the
+  # signal cannot actually see (main.py prints an advisory when you do).
+  #
+  # This is a strict gate -- it rejects pairs reverting more slowly than about a
+  # month. Trading slower relationships is legitimate; do it by raising BOTH
+  # this and zscore_window together (e.g. 60 and 60).
+  max_half_life: 20
+  min_half_life: 1
+
+backtest:
+  initial_capital: 100000.0
+  # Dollar-neutral sizing: this notional is committed long on one leg and short
+  # on the other, so the position carries no net market exposure at entry.
+  gross_exposure_per_leg: 10000.0
+  # dollar_neutral | beta_neutral
+  #   dollar_neutral -> equal dollars each side (net market exposure ~0)
+  #   beta_neutral   -> share counts in the hedge ratio (spread exposure ~0)
+  sizing: "dollar_neutral"
+  commission_bps: 1.0   # per side, per leg, in basis points of notional
+  slippage_bps: 2.0     # modelled as an adverse fill on entry and exit
+  risk_free_rate: 0.0   # annualised, for the Sharpe ratio numerator
+  trading_days_per_year: 252
+  allow_short: true
+
+execution:
+  # PAPER TRADING ONLY. execution_alpaca.py refuses to start if this URL does
+  # not contain "paper"; there is no live-trading code path in this project.
+  base_url: "https://paper-api.alpaca.markets"
+  notional_per_leg: 1000.0
+  time_in_force: "day"
+  # Refuse to send orders unless the market is open (Alpaca queues them
+  # otherwise, and the fill price then has nothing to do with the z-score that
+  # triggered it).
+  require_market_open: true
+  # Extra belt-and-braces guard: the account must report itself as a paper
+  # account before any order is submitted.
+  verify_paper_account: true
+
+logging:
+  trade_log: "logs/trades.csv"
+  level: "INFO"
+
+plot:
+  enabled: true
+  output: "logs/backtest_plot.png"
+  show: false     # true opens an interactive window; false writes the PNG only
