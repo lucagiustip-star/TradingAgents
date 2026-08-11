@@ -59,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Flatten both legs of the pair on the PAPER account and exit.")
     mode.add_argument("--risk-status", action="store_true",
                       help="Print the current risk limits and halt state, then exit.")
+    mode.add_argument("--dashboard", action="store_true",
+                      help="Build the HTML dashboard from the logs, risk state and a backtest.")
 
     parser.add_argument("--pair", type=_parse_pair, metavar="Y/X",
                         help="Ticker pair, dependent leg first (e.g. KO/PEP).")
@@ -109,6 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--plot-output", help="Path for the chart PNG.")
     out.add_argument("--trade-log", help="Path for the CSV trade log.")
     out.add_argument("--trades", action="store_true", help="Print the full round-trip ledger.")
+    out.add_argument("--dashboard-output", help="Path for the dashboard HTML.")
+    out.add_argument("--live", action="store_true",
+                     help="With --dashboard, include live paper-account state.")
+    out.add_argument("--open", action="store_true", dest="open_browser",
+                     help="With --dashboard, open the page in a browser when done.")
     out.add_argument("--verbose", "-v", action="store_true", help="Debug-level logging.")
     out.add_argument("--quiet", "-q", action="store_true", help="Warnings and errors only.")
 
@@ -340,6 +347,34 @@ def _risk_summary(config: Config, trader) -> str:
         return f" Risk     : (could not read account state: {exc})"
 
 
+def cmd_dashboard(config: Config, args: argparse.Namespace) -> int:
+    """Build the HTML dashboard.
+
+    Runs a backtest for the charts when price data is reachable, and falls back
+    to a logs-only page when it is not -- a dashboard that refuses to render
+    because the data vendor is down is useless exactly when you want it.
+    """
+    import webbrowser
+
+    from .dashboard import generate
+
+    result = None
+    try:
+        from .backtest import run_backtest
+        from .strategy import generate_signals
+
+        data = _load_data(config, args)
+        result = run_backtest(data, generate_signals(data, config), config)
+    except Exception as exc:
+        logger.warning("Backtest unavailable (%s); rendering logs and risk state only.", exc)
+
+    path = generate(config, args.dashboard_output, result, live=args.live)
+    print(f"\n Dashboard: {path}")
+    if args.open_browser:
+        webbrowser.open(path.resolve().as_uri())
+    return 0
+
+
 def cmd_risk_status(config: Config, args: argparse.Namespace) -> int:
     """Print the configured limits and the current halt state, without trading.
 
@@ -414,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.risk_status:
             return cmd_risk_status(config, args)
+        if args.dashboard:
+            return cmd_dashboard(config, args)
         if args.check_only:
             return cmd_check(config, args)
         if args.backtest:

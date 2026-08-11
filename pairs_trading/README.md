@@ -50,7 +50,10 @@ python -m pairs_trading.main --risk-status
 python -m pairs_trading.main --paper-trade --pair KO/PEP --dry-run
 python -m pairs_trading.main --paper-trade --pair KO/PEP
 
-# 6. Emergency stop, any time.
+# 6. Build the dashboard and open it.
+python -m pairs_trading.main --dashboard --pair KO/PEP --open
+
+# 7. Emergency stop, any time.
 python -m pairs_trading.kill_switch --reason "stopping for the day"
 ```
 
@@ -194,7 +197,39 @@ server must never stop a halt.
 Everything lands in `logs/risk_events.csv` with full account context at the
 moment of the decision.
 
-### 6. Execution (`execution_alpaca.py`)
+### 6. Dashboard (`dashboard.py`)
+
+```bash
+python -m pairs_trading.main --dashboard --pair KO/PEP --open
+python -m pairs_trading.main --dashboard --pair KO/PEP --live   # + paper account state
+python -m pairs_trading.dashboard --no-backtest                 # logs and risk state only
+```
+
+Writes one self-contained HTML file (`logs/dashboard.html`) — all CSS, JS and
+chart geometry inlined, so it opens from disk, survives being emailed, and makes
+no external request. Nothing about what you trade reaches a CDN.
+
+It shows, in scanning order: halt state, headline metrics, risk-limit usage
+meters, cumulative P&L, drawdown, the recent z-score window with every fill
+marked, then the trade and risk-event logs.
+
+Charts are hand-built SVG with a crosshair-and-tooltip hover layer. Two rules
+they follow that are easy to get wrong:
+
+- **One y-axis per chart.** Drawdown gets its own panel rather than a second
+  scale on the P&L chart. Two scales in one frame invite the reader to read
+  meaning into where the curves cross, and those crossings are an artefact of
+  the independent scalings.
+- **The z-score panel is windowed** to the last 250 bars. Compressing a
+  multi-year history into one frame renders the line as a solid block and stacks
+  every trade marker on top of the last, misrepresenting how often the signal
+  actually fires.
+
+Every section has an empty state, so the page is useful on a fresh install, and
+it still renders when the data vendor or broker is unreachable — which is
+exactly when you want to look at it.
+
+### 7. Execution (`execution_alpaca.py`)
 
 `sync_to_signal` is a **reconciler**, not an order generator: it reads the target
 and the broker's actual position and issues only the difference. Running it twice

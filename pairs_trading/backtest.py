@@ -621,8 +621,8 @@ def plot_results(result: BacktestResult, output: str | Path | None = None, show:
     y_col, x_col = result.signals.pair_y, result.signals.pair_x
     sig = result.config.signal
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True,
-                             gridspec_kw={"height_ratios": [1.0, 1.3, 1.2]})
+    fig, axes = plt.subplots(4, 1, figsize=(14, 13.5), sharex=True,
+                             gridspec_kw={"height_ratios": [1.0, 1.3, 1.2, 0.7]})
     fig.suptitle(
         f"Pairs trading: {result.pair}   "
         f"[{result.config.spread.method}, z-window {sig.zscore_window}, "
@@ -688,13 +688,6 @@ def plot_results(result: BacktestResult, output: str | Path | None = None, show:
     ax.fill_between(pnl.index, pnl, 0, where=(pnl >= 0), color="#2ca02c", alpha=0.15)
     ax.fill_between(pnl.index, pnl, 0, where=(pnl < 0), color="#d62728", alpha=0.15)
 
-    dd_ax = ax.twinx()
-    drawdown = (result.equity / result.equity.cummax() - 1.0) * 100.0
-    dd_ax.fill_between(drawdown.index, drawdown, 0, color="#d62728", alpha=0.25,
-                       label="drawdown (%)")
-    dd_ax.set_ylabel("Drawdown (%)")
-    dd_ax.set_ylim(min(drawdown.min() * 3.0, -1.0), 0.5)
-
     m = result.metrics
     ax.set_ylabel("Cumulative P&L ($)")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
@@ -705,6 +698,20 @@ def plot_results(result: BacktestResult, output: str | Path | None = None, show:
         f"{m.n_trades} trades  |  win rate {m.win_rate:.0%}",
         fontsize=10, loc="left",
     )
+
+    # --- Panel 4: drawdown, on its own axis ---------------------------------
+    # Deliberately a separate panel rather than a second y-axis on the P&L
+    # chart. Two scales sharing one frame invite the reader to read meaning
+    # into where the curves cross, and those crossings are an artefact of the
+    # independent scalings, not a fact about the strategy.
+    ax = axes[3]
+    drawdown = (result.equity / result.equity.cummax() - 1.0) * 100.0
+    ax.fill_between(drawdown.index, drawdown, 0, color="#d62728", alpha=0.25)
+    ax.plot(drawdown.index, drawdown, color="#d62728", linewidth=1.0)
+    ax.set_ylabel("Drawdown (%)")
+    ax.set_ylim(min(drawdown.min() * 1.15, -0.5), 0.5)
+    ax.grid(alpha=0.3)
+    ax.set_title("Drawdown from running peak", fontsize=10, loc="left")
     ax.set_xlabel("Date")
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
