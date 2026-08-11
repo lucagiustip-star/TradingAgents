@@ -300,6 +300,43 @@ class RiskConfig:
 
 
 @dataclass(frozen=True)
+class NewsConfig:
+    """Settings for the news-driven trading veto.
+
+    The guard can only ever *stop* trading, never start or direct it. See
+    ``news_guard.py`` for why that asymmetry is deliberate.
+
+    Attributes:
+        enabled: Run the guard automatically before each paper-trading run.
+        lookback_hours: How far back to scan. Should comfortably exceed the gap
+            between runs, so a weekend cannot hide a Friday-evening merger
+            announcement.
+        max_items: Cap on headlines fetched per scan.
+        max_symbols: Items tagged with more symbols than this are treated as
+            market roundups rather than news about the pair, and skipped.
+        halt_on_blocking: Write the halt flag when a structural event is found.
+        fail_closed: Halt when the news feed itself is unreachable. Off by
+            default -- a veto that stops on its own outage hands the news vendor
+            an off-switch for your strategy, and missing news is not evidence.
+    """
+
+    enabled: bool = True
+    lookback_hours: float = 96.0
+    max_items: int = 50
+    max_symbols: int = 8
+    halt_on_blocking: bool = True
+    fail_closed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.lookback_hours <= 0:
+            raise ConfigError("news.lookback_hours must be positive.")
+        if self.max_items < 1:
+            raise ConfigError("news.max_items must be at least 1.")
+        if self.max_symbols < 1:
+            raise ConfigError("news.max_symbols must be at least 1.")
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     trade_log: str = "logs/trades.csv"
     level: str = "INFO"
@@ -324,6 +361,7 @@ class Config:
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    news: NewsConfig = field(default_factory=NewsConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     plot: PlotConfig = field(default_factory=PlotConfig)
     source_path: str | None = None
@@ -515,6 +553,7 @@ def load_config(path: str | Path | None = None) -> Config:
         backtest=_build(BacktestConfig, _section(raw, "backtest"), "backtest"),
         execution=_build(ExecutionConfig, _section(raw, "execution"), "execution"),
         risk=_build(RiskConfig, _section(raw, "risk"), "risk"),
+        news=_build(NewsConfig, _section(raw, "news"), "news"),
         logging=_build(LoggingConfig, _section(raw, "logging"), "logging"),
         plot=_build(PlotConfig, _section(raw, "plot"), "plot"),
         source_path=str(cfg_path),

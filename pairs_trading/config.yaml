@@ -153,6 +153,37 @@ risk:
   buying_power_buffer_usd: 0.0
   alert_on_rejection: true
 
+# ---------------------------------------------------------------------------
+# News guard. A VETO, never a signal: it can stop the strategy trading, and can
+# never tell it what to trade.
+#
+# Cointegration assumes a stable long-run relationship between the two legs.
+# A merger, spin-off, bankruptcy or delisting ENDS that relationship, while the
+# z-score keeps producing confident entries into a spread that will never
+# revert. This catches those before the statistics do.
+#
+# Earnings, guidance and analyst moves are deliberately NOT blocking -- that
+# divergence is exactly what this strategy exists to trade. Halting on it would
+# be an off-switch, not a risk control.
+#
+# Uses Alpaca's news API, so it needs no credentials beyond the paper keys you
+# already have.
+# ---------------------------------------------------------------------------
+news:
+  enabled: true
+  # Should comfortably exceed the gap between runs, so a weekend cannot hide a
+  # Friday-evening announcement. 96h covers a long weekend.
+  lookback_hours: 96
+  max_items: 50
+  # Items tagged with more symbols than this are market roundups, not news
+  # about your pair.
+  max_symbols: 8
+  halt_on_blocking: true
+  # Halt when the news feed itself is unreachable. Off by default: a veto that
+  # stops on its own outage hands the news vendor an off-switch for your
+  # strategy, and missing news is not evidence of a problem.
+  fail_closed: false
+
 logging:
   trade_log: "logs/trades.csv"
   level: "INFO"

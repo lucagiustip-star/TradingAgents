@@ -63,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Build the HTML dashboard from the logs, risk state and a backtest.")
     mode.add_argument("--check-alpaca", action="store_true",
                       help="Verify the Alpaca paper setup end to end (read-only) and exit.")
+    mode.add_argument("--news-check", action="store_true",
+                      help="Scan the pair's recent news for structural breaks and exit.")
 
     parser.add_argument("--pair", type=_parse_pair, metavar="Y/X",
                         help="Ticker pair, dependent leg first (e.g. KO/PEP).")
@@ -134,6 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Cap on gross notional across all open positions.")
     risk.add_argument("--max-daily-loss", type=float, metavar="USD",
                       help="Daily loss that trips the circuit breaker.")
+    risk.add_argument("--news-lookback", type=float, metavar="HOURS",
+                      help="How far back the news guard scans.")
+    risk.add_argument("--no-news", action="store_true",
+                      help="Skip the news guard before paper trading.")
 
     return parser
 
@@ -191,9 +197,13 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
         "max_daily_loss_usd": args.max_daily_loss,
     }
 
+    news = {"lookback_hours": args.news_lookback}
+    if args.no_news:
+        news["enabled"] = False
+
     return config.with_overrides(
         pair=pair, data=data, spread=spread, signal=signal, backtest=backtest,
-        cointegration=coint, plot=plot, logging=logging_cfg, risk=risk,
+        cointegration=coint, plot=plot, logging=logging_cfg, risk=risk, news=news,
     )
 
 
@@ -299,6 +309,23 @@ def cmd_paper_trade(config: Config, args: argparse.Namespace) -> int:
     if halted is not None:
         return halted
 
+    # The news guard runs BEFORE the statistics. A merger announced yesterday
+    # ends the relationship today, but the cointegration test is computed from
+    # historical prices and will happily still pass -- it cannot see an event
+    # that has not moved the spread yet.
+    if config.news.enabled:
+        from .news_guard import NewsGuard
+
+        scan = NewsGuard(config).run(args.news_lookback)
+        if scan.blocking or scan.warnings or scan.error:
+            print(scan.report())
+        else:
+            print(f" News     : clear ({scan.scanned} item(s) scanned, no structural break)")
+        if scan.halted:
+            print("\n  Trading halted by the news guard. Review, then:", file=sys.stderr)
+            print("      python -m pairs_trading.kill_switch --clear\n", file=sys.stderr)
+            return 4
+
     data = _load_data(config, args)
     _run_cointegration(data, config, args)
 
@@ -347,6 +374,23 @@ def _risk_summary(config: Config, trader) -> str:
         )
     except Exception as exc:  # reporting must not block trading
         return f" Risk     : (could not read account state: {exc})"
+
+
+def cmd_news_check(config: Config, args: argparse.Namespace) -> int:
+    """Scan the pair's recent news for structural breaks.
+
+    Exit 0 clear, 4 structural event found (trading halted), 6 feed unavailable.
+    """
+    from .news_guard import NewsGuard
+
+    result = NewsGuard(config).run(args.news_lookback)
+    print(result.report())
+
+    if result.blocking:
+        return 4
+    if result.error:
+        return 6
+    return 0
 
 
 def cmd_check_alpaca(config: Config, args: argparse.Namespace) -> int:
@@ -470,6 +514,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_risk_status(config, args)
         if args.check_alpaca:
             return cmd_check_alpaca(config, args)
+        if args.news_check:
+            return cmd_news_check(config, args)
         if args.dashboard:
             return cmd_dashboard(config, args)
         if args.check_only:

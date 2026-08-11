@@ -232,7 +232,50 @@ Every section has an empty state, so the page is useful on a fresh install, and
 it still renders when the data vendor or broker is unreachable — which is
 exactly when you want to look at it.
 
-### 7. Execution (`execution_alpaca.py`)
+### 7. News guard (`news_guard.py`)
+
+```bash
+python -m pairs_trading.main --news-check --pair KO/PEP
+```
+
+A **veto, never a signal**: it can stop the strategy trading, and can never tell
+it what to trade. The strategy decides on daily bars with a one-bar lag, so a
+headline cannot usefully inform *direction* — there is no path from news to a
+better z-score. What news can do is reveal that the spread's equilibrium has
+structurally changed, which the statistics only discover later, after the loss.
+
+The distinction that makes it useful rather than an off-switch:
+
+| Event | Verdict | Why |
+|---|---|---|
+| Merger, acquisition, take-private, spin-off | **halt** | The pair stops being two independent companies |
+| Bankruptcy, delisting, trading suspension | **halt** | One leg stops being continuously tradeable |
+| Restatement, auditor resignation, SEC probe | **halt** | Reported fundamentals stop being trustworthy |
+| Index add/remove, CEO exit, antitrust | warn | Real flow effects, relationship survives |
+| Earnings, guidance, upgrades, dividends | ignore | **This is the divergence the strategy trades** |
+
+Halting on earnings would defeat the strategy, so it doesn't. Only structural
+events halt, and they write the same `TRADING_HALTED` flag the circuit breaker
+and kill switch use — one way to resume, not three.
+
+Runs automatically before each paper-trading session (`news.enabled`), **before**
+the cointegration test: a merger announced yesterday ends the relationship today,
+but the statistics are computed from historical prices and will happily still
+pass.
+
+Uses Alpaca's news API, so it needs **no credentials beyond the paper keys you
+already have**. Classification is rule-based — deterministic, inspectable, and
+testable without a model in the loop; `NewsGuard.classify` is the single
+extension point if you later want an LLM to read ambiguous cases.
+
+Two deliberate biases, both documented in the module: it **fails open** when the
+feed is unreachable (a veto that halts on its own outage hands the news vendor an
+off-switch, and missing news is not evidence), and it **over-triggers rather than
+under-triggers** on ambiguous deal language, because a false positive costs a
+pause you clear in one command while a false negative costs money for as long as
+the spread keeps not reverting.
+
+### 8. Execution (`execution_alpaca.py`)
 
 `sync_to_signal` is a **reconciler**, not an order generator: it reads the target
 and the broker's actual position and issues only the difference. Running it twice
