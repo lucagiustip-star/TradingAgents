@@ -15,8 +15,10 @@ loop rather than a series of edits.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from .config import NULL, Config, ConfigError, load_config, resolve_path
@@ -65,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Verify the Alpaca paper setup end to end (read-only) and exit.")
     mode.add_argument("--news-check", action="store_true",
                       help="Scan the pair's recent news for structural breaks and exit.")
+    mode.add_argument("--init-env", action="store_true",
+                      help="Create a blank .env in the right place for your Alpaca keys.")
 
     parser.add_argument("--pair", type=_parse_pair, metavar="Y/X",
                         help="Ticker pair, dependent leg first (e.g. KO/PEP).")
@@ -122,6 +126,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="With --dashboard, open the page in a browser when done.")
     out.add_argument("--verbose", "-v", action="store_true", help="Debug-level logging.")
     out.add_argument("--quiet", "-q", action="store_true", help="Warnings and errors only.")
+
+    setup = parser.add_argument_group("setup")
+    setup.add_argument("--overwrite", action="store_true",
+                       help="With --init-env, replace an existing .env (backed up first). "
+                            "Deliberately not --force, which means something else here and "
+                            "must never be habit-typed at a file holding live credentials.")
 
     live = parser.add_argument_group("paper trading")
     live.add_argument("--dry-run", action="store_true",
@@ -376,6 +386,103 @@ def _risk_summary(config: Config, trader) -> str:
         return f" Risk     : (could not read account state: {exc})"
 
 
+ENV_TEMPLATE = """\
+# Alpaca PAPER trading credentials.
+# Created by: python -m pairs_trading.main --init-env
+#
+# 1. Go to https://app.alpaca.markets and make sure the dashboard is set to
+#    PAPER, not Live. Paper and live keys are different credentials; live keys
+#    will not work here.
+# 2. Generate a key. The secret is shown ONCE -- copy it before closing.
+# 3. Paste both values after the '=' below. No quotes, no spaces around the '='.
+#
+# This file is gitignored. Never commit it, paste it into a chat, or include it
+# in a screenshot. If a key is ever exposed, revoke it at Alpaca and generate a
+# new one -- it takes seconds.
+
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
+
+# ---------------------------------------------------------------------------
+# Optional: email alerts for circuit-breaker trips, kill-switch activations and
+# risk rejections. Leave blank and alerts go to the application log only.
+# For Gmail use an app password, not your account password.
+# ---------------------------------------------------------------------------
+#SMTP_HOST=smtp.gmail.com
+#SMTP_PORT=587
+#SMTP_USER=
+#SMTP_PASSWORD=
+#SMTP_FROM=
+#SMTP_TO=
+#SMTP_USE_TLS=true
+"""
+
+
+def cmd_init_env(config: Config, args: argparse.Namespace) -> int:
+    """Create a blank ``.env`` at the repository root, ready for credentials.
+
+    Refuses to overwrite an existing file. A ``.env`` holds live secrets, and
+    silently replacing one would destroy working credentials with no way back;
+    ``--force`` takes a timestamped backup first rather than clobbering.
+
+    On POSIX the file is created 0600 (owner read/write only), since a
+    world-readable secrets file on a shared machine is a real exposure.
+    """
+    from .config import PACKAGE_DIR, find_dotenv
+
+    path = PACKAGE_DIR.parent / ".env"
+
+    if path.exists():
+        if not args.overwrite:
+            existing = find_dotenv()
+            print(
+                f"\n  A .env already exists at {path}\n\n"
+                "  Not overwriting it -- it may hold working credentials.\n"
+                f"  Edit it directly, or re-run with --overwrite to replace it\n"
+                "  (a timestamped backup is taken first).\n",
+                file=sys.stderr,
+            )
+            if existing:
+                print(f"  Currently loaded from: {existing}\n", file=sys.stderr)
+            return 2
+        # with_suffix() is wrong here: ".env" is all stem and no suffix, so it
+        # would produce ".env.env.backup-...". Build the name explicitly.
+        backup = path.with_name(f"{path.name}.backup-{datetime.now():%Y%m%d-%H%M%S}")
+        path.replace(backup)
+        # The backup holds the same live credentials as the original, so it gets
+        # owner-only permissions regardless of what the original was set to.
+        with contextlib.suppress(OSError):
+            backup.chmod(0o600)
+        print(f"  Existing .env backed up to {backup}")
+
+    path.write_text(ENV_TEMPLATE, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)   # owner-only; no-op semantics on Windows
+
+    print(f"""
+  Created {path}
+
+  Next:
+    1. Open it:            {_editor_hint(path)}
+    2. Get PAPER keys:     https://app.alpaca.markets/paper/dashboard/overview
+                           (check the dashboard says Paper, not Live)
+    3. Paste them after ALPACA_API_KEY= and ALPACA_SECRET_KEY=
+    4. Verify:             python -m pairs_trading.main --check-alpaca
+
+  This file is gitignored. Never commit or share it.
+""")
+    return 0
+
+
+def _editor_hint(path: Path) -> str:
+    """A copy-pasteable open command for the current platform."""
+    if sys.platform == "win32":
+        return f"notepad {path}"
+    if sys.platform == "darwin":
+        return f"open -e {path}"
+    return f"nano {path}"
+
+
 def cmd_news_check(config: Config, args: argparse.Namespace) -> int:
     """Scan the pair's recent news for structural breaks.
 
@@ -516,6 +623,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_check_alpaca(config, args)
         if args.news_check:
             return cmd_news_check(config, args)
+        if args.init_env:
+            return cmd_init_env(config, args)
         if args.dashboard:
             return cmd_dashboard(config, args)
         if args.check_only:

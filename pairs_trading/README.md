@@ -22,11 +22,22 @@ pip install -r pairs_trading/requirements.txt   # pinned, reproducible
 pip install ".[pairs]"
 ```
 
-For paper trading, copy the env template to the **repository root** and fill in
-your Alpaca paper keys:
+For paper trading, create the credentials file and fill in your Alpaca **paper**
+keys:
 
 ```bash
-cp pairs_trading/.env.example .env
+python -m pairs_trading.main --init-env
+```
+
+That writes a blank `.env` at the repository root, mode `0600`, and prints the
+command to open it. It refuses to overwrite an existing `.env` — that file may
+hold working credentials — and `--overwrite` takes a timestamped backup first.
+Both `.env` and its backups are gitignored.
+
+Verify without pasting a key anywhere:
+
+```bash
+python -m pairs_trading.main --check-alpaca
 ```
 
 ---

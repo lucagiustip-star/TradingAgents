@@ -609,6 +609,103 @@ class TestDotenvDiscovery:
         assert all(p.name == ".env" for p in dotenv_search_paths())
 
 
+class TestInitEnv:
+    """`--init-env` writes the credentials file. It must never destroy one."""
+
+    def _run(self, tmp_path, monkeypatch, argv):
+        from pairs_trading import main as main_module
+
+        monkeypatch.setattr(main_module, "PACKAGE_DIR", tmp_path / "pairs_trading",
+                            raising=False)
+        # cmd_init_env imports PACKAGE_DIR from .config at call time.
+        from pairs_trading import config as config_module
+
+        monkeypatch.setattr(config_module, "PACKAGE_DIR", tmp_path / "pkg")
+        (tmp_path / "pkg").mkdir(exist_ok=True)
+        return main_module.main(argv)
+
+    def test_creates_the_file_with_both_keys_blank(self, tmp_path, monkeypatch, capsys):
+        assert self._run(tmp_path, monkeypatch, ["--init-env"]) == 0
+        env = tmp_path / ".env"
+        assert env.exists()
+        text = env.read_text()
+        assert "ALPACA_API_KEY=" in text
+        assert "ALPACA_SECRET_KEY=" in text
+        # Blank, not pre-filled with anything that looks like a credential.
+        assert "\nALPACA_API_KEY=\n" in text
+
+    def test_file_is_owner_only_on_posix(self, tmp_path, monkeypatch):
+        import sys as _sys
+
+        if _sys.platform == "win32":
+            pytest.skip("POSIX permissions only")
+        self._run(tmp_path, monkeypatch, ["--init-env"])
+        assert (tmp_path / ".env").stat().st_mode & 0o077 == 0
+
+    def test_refuses_to_overwrite_existing_credentials(self, tmp_path, monkeypatch, capsys):
+        """The whole point: never silently destroy working keys."""
+        env = tmp_path / ".env"
+        env.write_text("ALPACA_API_KEY=PKREAL\nALPACA_SECRET_KEY=realsecret\n")
+
+        code = self._run(tmp_path, monkeypatch, ["--init-env"])
+        assert code == 2
+        assert env.read_text() == "ALPACA_API_KEY=PKREAL\nALPACA_SECRET_KEY=realsecret\n"
+        assert "Not overwriting" in capsys.readouterr().err
+
+    def test_overwrite_backs_up_first(self, tmp_path, monkeypatch):
+        env = tmp_path / ".env"
+        env.write_text("ALPACA_API_KEY=PKREAL\n")
+
+        assert self._run(tmp_path, monkeypatch, ["--init-env", "--overwrite"]) == 0
+        backups = list(tmp_path.glob(".env.backup-*"))
+        assert len(backups) == 1
+        assert "PKREAL" in backups[0].read_text()
+        assert "PKREAL" not in env.read_text()
+
+    def test_backup_name_is_well_formed(self, tmp_path, monkeypatch):
+        """`.env` is all stem and no suffix, so with_suffix() would mangle it."""
+        (tmp_path / ".env").write_text("x=1\n")
+        self._run(tmp_path, monkeypatch, ["--init-env", "--overwrite"])
+        backup = next(tmp_path.glob(".env.backup-*"))
+        assert not backup.name.startswith(".env.env")
+        assert backup.name.count(".env") == 1
+
+    def test_backups_are_gitignored(self):
+        """A backup holds the same live keys as .env and must not be committable."""
+        from pathlib import Path
+
+        gitignore = Path(".gitignore").read_text()
+        assert ".env.backup-*" in gitignore
+
+    def test_template_mentions_paper_not_live(self):
+        from pairs_trading.main import ENV_TEMPLATE
+
+        assert "PAPER" in ENV_TEMPLATE
+        assert "gitignored" in ENV_TEMPLATE
+
+    def test_template_carries_no_placeholder_credentials(self):
+        """A template with fake-looking keys invites committing them."""
+        from pairs_trading.main import ENV_TEMPLATE
+
+        for line in ENV_TEMPLATE.splitlines():
+            if line.startswith(("ALPACA_API_KEY=", "ALPACA_SECRET_KEY=")):
+                assert line.split("=", 1)[1] == ""
+
+    def test_cli_exposes_the_mode(self):
+        from pairs_trading.main import build_parser
+
+        assert build_parser().parse_args(["--init-env"]).init_env is True
+
+    def test_overwrite_is_a_distinct_flag_from_force(self):
+        """--force means 'ignore the cointegration gate'. Habit-typing it must
+        not be able to destroy a credentials file."""
+        from pairs_trading.main import build_parser
+
+        args = build_parser().parse_args(["--init-env", "--force"])
+        assert args.force is True
+        assert args.overwrite is False
+
+
 # --------------------------------------------------------------------------
 # strategy: spread and z-score
 # --------------------------------------------------------------------------
