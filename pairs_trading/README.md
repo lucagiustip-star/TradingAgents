@@ -12,6 +12,11 @@ in the rest of this repository — no shared imports, no shared config.
 > latching daily-loss circuit breaker, and a kill switch — enforced by a
 > clearance token that `_submit` requires, so the layer cannot be routed around.
 
+> **Not sure where to actually run this?** It is a program, not a website.
+> See **[SETUP.md](SETUP.md)** — it covers running it in your browser via GitHub
+> Codespaces (nothing to install) or on your own computer, and where to get
+> Alpaca keys.
+
 ---
 
 ## Install
