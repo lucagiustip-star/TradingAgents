@@ -221,3 +221,12 @@ __marimo__/
 # Enterprise env file (secrets) and generated run reports
 .env.enterprise
 reports/
+
+# Credential backups written by `--init-env --overwrite`. These hold the SAME
+# live keys as .env, so they must never be committable.
+.env.backup-*
+.env.*.backup-*
+
+# Pairs-trading runtime output (trade logs, charts, cached price data)
+logs/
+pairs_trading/logs/
